@@ -26,6 +26,9 @@ Usage:
     hits = bm25_search(workspace_id, "quarterly revenue", top_k=20)
     for h in hits:
         print(h.chunk_id, h.score, h.chunk_text[:80])
+
+Chunk schema (see app.db.vector.DOC_ID_FIELD and app.rag.chunker.Chunk):
+    doc_id, workspace_id, chunk_text, page_num, embedding (2048), ...
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from app.db.mongo import pdfs_collection
+from app.db.mongodb import get_pdfs_collection
 
 
 BM25_INDEX_NAME = "bm25_index"
@@ -51,6 +54,22 @@ class BM25Hit:
     chunk_text: str
     page_num: int | None
     score: float
+
+    def to_pipeline_chunk(self) -> dict[str, Any]:
+        """Return the chunk shape expected by `app.rag.pipeline._format_context`.
+
+        T-012's SSE pipeline keys on `doc_id` and `chunk_id` — the same
+        field names the storage layer (`app.db.vector`) uses, so this
+        method is a pure projection rather than a rename.
+        """
+        return {
+            "doc_id": self.doc_id,
+            "chunk_id": self.chunk_id,
+            "chunk_text": self.chunk_text,
+            "page_num": self.page_num,
+            "score": self.score,
+            "source": "bm25",
+        }
 
 
 def _coerce_top_k(top_k: int) -> int:
@@ -141,7 +160,7 @@ def bm25_search(
     """
 
     pipeline = build_bm25_pipeline(workspace_id, query, top_k, index_name)
-    coll = pdfs_collection()
+    coll = get_pdfs_collection()
     cursor = coll.aggregate(pipeline)
     hits: list[BM25Hit] = []
     for doc in cursor:
