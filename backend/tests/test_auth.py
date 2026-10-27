@@ -102,6 +102,101 @@ def test_mint_rejects_bad_owner_id():
         create_session_token("has.dots")  # `.` is reserved as a splitter
 
 
+# ---- tokens.py: server-side lifetime -----------------------------------------
+
+
+def test_token_carries_issued_at_in_random_segment():
+    from app.security import tokens
+
+    before = int(time.time())
+    tok = tokens.create_session_token("admin")
+    _, _, random_segment, _ = tok.split(".")
+    assert len(random_segment) == 56
+    issued_at = int(random_segment[:8], 16)
+    assert before <= issued_at <= int(time.time())
+
+    claims = tokens.parse_session_token(tok)
+    assert claims is not None
+    assert claims.owner_id == "admin"
+    assert claims.expires_at == claims.issued_at + tokens.session_max_age()
+
+
+def test_token_rejected_after_max_age(monkeypatch):
+    from app.security import tokens
+
+    minted_at = 1_800_000_000
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at)
+    tok = tokens.create_session_token("admin")
+
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at + tokens.SESSION_MAX_AGE - 1)
+    assert tokens.verify_session_token(tok) == "admin"
+
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at + tokens.SESSION_MAX_AGE)
+    assert tokens.verify_session_token(tok) is None
+
+
+def test_token_issued_in_the_future_rejected(monkeypatch):
+    from app.security import tokens
+
+    minted_at = 1_800_000_000
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at)
+    tok = tokens.create_session_token("admin")
+
+    # Inside the skew window is fine; beyond it is a forgery or a bad clock.
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at - tokens.CLOCK_SKEW_SEC)
+    assert tokens.verify_session_token(tok) == "admin"
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at - tokens.CLOCK_SKEW_SEC - 1)
+    assert tokens.verify_session_token(tok) is None
+
+
+def test_issued_at_cannot_be_rewritten_without_resigning(monkeypatch):
+    """Bumping the embedded issued-at to extend a session must break the HMAC."""
+    from app.security import tokens
+
+    monkeypatch.setattr(tokens, "_now", lambda: 1_800_000_000)
+    tok = tokens.create_session_token("admin")
+    v, owner, random_segment, sig = tok.split(".")
+    later = f"{1_800_000_000 + 10:08x}" + random_segment[8:]
+    assert tokens.verify_session_token(f"{v}.{owner}.{later}.{sig}") is None
+
+
+def test_pre_issued_at_format_token_rejected():
+    """A 64-hex nonce with no issued-at (the old layout) no longer verifies."""
+    from app.security import tokens
+
+    secret = tokens._secret_bytes()
+    body = f"v2.admin.{'ab' * 32}"
+    sig = tokens._sign(body, secret)
+    assert tokens.verify_session_token(f"{body}.{sig}") is None
+
+
+def test_session_max_age_env_override(monkeypatch):
+    monkeypatch.setenv("SESSION_MAX_AGE", "120")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.security import tokens
+
+    assert tokens.session_max_age() == 120
+    minted_at = 1_800_000_000
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at)
+    tok = tokens.create_session_token("admin")
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at + 119)
+    assert tokens.verify_session_token(tok) == "admin"
+    monkeypatch.setattr(tokens, "_now", lambda: minted_at + 120)
+    assert tokens.verify_session_token(tok) is None
+
+
+def test_session_max_age_seconds_env_still_honoured(monkeypatch):
+    monkeypatch.setenv("SESSION_MAX_AGE_SECONDS", "300")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.security.tokens import session_max_age
+
+    assert session_max_age() == 300
+
+
 # ---- password.py / owner resolution ------------------------------------------
 
 
@@ -287,6 +382,65 @@ def test_logout_clears_cookie(client):
     # the gate re-blocks us.
     client.cookies.clear()
     assert client.get("/api/documents/ping").status_code == 401
+
+
+def test_login_cookie_attributes(client):
+    res = client.post("/api/auth", json={"password": "correct horse"})
+    cookie = res.headers.get("set-cookie", "")
+    assert cookie.startswith("app_session=v2.admin.")
+    assert "Max-Age=604800" in cookie
+    assert "HttpOnly" in cookie
+    assert "Path=/" in cookie
+    assert "SameSite=lax" in cookie
+    # APP_ENV=development in this suite: no Secure flag, so local HTTP works.
+    assert "Secure" not in cookie
+
+
+def test_login_cookie_secure_in_production(client, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    res = client.post("/api/auth", json={"password": "correct horse"})
+    assert res.status_code == 200
+    cookie = res.headers.get("set-cookie", "")
+    assert "Secure" in cookie
+
+    out = client.delete("/api/auth")
+    assert "Secure" in out.headers.get("set-cookie", "")
+
+
+def test_logout_cookie_attributes_match_login(client):
+    res = client.delete("/api/auth")
+    cookie = res.headers.get("set-cookie", "")
+    assert cookie.startswith('app_session=""') or cookie.startswith("app_session=;")
+    assert "Max-Age=0" in cookie
+    assert "HttpOnly" in cookie
+    assert "Path=/" in cookie
+    assert "SameSite=lax" in cookie
+
+
+def test_me_reports_owner_and_expiry(client):
+    assert client.get("/api/auth/me").status_code == 401
+
+    client.post("/api/auth", json={"password": "correct horse"})
+    res = client.get("/api/auth/me")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["owner_id"] == "admin"
+    assert body["is_admin"] is True
+    assert body["expires_at"] - body["issued_at"] == 7 * 24 * 3600
+
+
+def test_expired_cookie_is_rejected_by_gate_and_me(client, monkeypatch):
+    from app.security import tokens
+
+    client.post("/api/auth", json={"password": "correct horse"})
+    assert client.get("/api/documents/ping").status_code == 200
+
+    monkeypatch.setattr(tokens, "_now", lambda: int(time.time()) + tokens.SESSION_MAX_AGE + 1)
+    assert client.get("/api/documents/ping").status_code == 401
+    assert client.get("/api/auth/me").status_code == 401
 
 
 def test_rate_limit_endpoint_response(client):

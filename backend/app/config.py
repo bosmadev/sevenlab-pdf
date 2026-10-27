@@ -1,11 +1,16 @@
 """Centralised settings. All secrets flow from `.env` only."""
 from functools import lru_cache
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     # Service
     app_env: str = Field(default="development")
@@ -16,7 +21,11 @@ class Settings(BaseSettings):
     # Auth
     app_password_hash: str = Field(default="")
     session_secret: str = Field(default="")
-    session_max_age_seconds: int = Field(default=7 * 24 * 3600)
+    # `.env.sample` documents this as SESSION_MAX_AGE; the longer name is kept for compatibility.
+    session_max_age_seconds: int = Field(
+        default=7 * 24 * 3600,
+        validation_alias=AliasChoices("SESSION_MAX_AGE", "SESSION_MAX_AGE_SECONDS"),
+    )
 
     # Databases
     mongodb_uri: str = Field(default="")
@@ -34,6 +43,16 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_model: str = Field(default="Cohere-Embed-V5-Pro")
     embedding_dimensions: int = Field(default=2048)
+
+    # OCR (T-005) — tier 3 is Azure Computer Vision v4 Image Analysis.
+    # OCR_ENABLE_AZURE=false keeps OCR at tiers 1-2 (zero cost).
+    # AZURE_CV_ENDPOINT / AZURE_CV_KEY override the host + key for the Vision
+    # REST path; when unset the AZURE_AI_API_BASE / AZURE_AI_API_KEY pair is
+    # reused. Set them when Vision is served from a separate
+    # *.cognitiveservices.azure.com resource.
+    ocr_enable_azure: bool = Field(default=True)
+    azure_cv_endpoint: str = Field(default="")
+    azure_cv_key: str = Field(default="")
 
     # Chunking (T-006)
     chunk_size: int = Field(default=1000)

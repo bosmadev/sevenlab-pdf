@@ -10,6 +10,7 @@
  * downgraded backend or a test harness still streams.
  * Ordering guarantee from T-012: `citations` arrives before the first token.
  */
+import { redirectToLogin } from "./session";
 import type { Citation } from "./types";
 
 export type SseEvent =
@@ -36,6 +37,11 @@ export async function streamChat(
     credentials: "same-origin",
   });
 
+  if (res.status === 401) {
+    redirectToLogin();
+    onEvent({ type: "error", message: "session expired — sign in again" });
+    return;
+  }
   if (!res.ok || !res.body) {
     const msg = `HTTP ${res.status}`;
     onEvent({ type: "error", message: msg });

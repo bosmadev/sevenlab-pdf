@@ -7,8 +7,36 @@
  * from `pending | parsing | chunking | embedding | ready | error`; this
  * module normalises both to the three-state UI shape in `lib/types.ts`.
  */
-import { api } from "./api";
+import { ApiError, UnauthorizedError, api, apiUrl, errorMessageFromBody } from "./api";
+import { redirectToLogin } from "./session";
 import type { DocumentSummary } from "./types";
+
+/** Must match backend `MAX_PDF_SIZE_MB` (services/pdf_validator.py). */
+export const DEFAULT_MAX_PDF_MB = 50;
+
+/**
+ * Client-side mirror of `services/pdf_validator.py`: extension, declared
+ * MIME, non-empty, size cap. Returns a human reason or `null` when the file
+ * is worth sending. The backend stays authoritative (magic bytes, sanitizer).
+ */
+export function validatePdfFile(
+  file: File,
+  maxSizeMb: number = DEFAULT_MAX_PDF_MB,
+): string | null {
+  if (!/\.pdf$/i.test(file.name)) return "only .pdf files are accepted";
+  // Drag-dropped files sometimes carry an empty `type`, so the extension
+  // check above is the one that always runs; MIME is checked when present.
+  if (file.type && file.type !== "application/pdf") {
+    return `unexpected file type: ${file.type}`;
+  }
+  if (file.size === 0) return "empty file";
+  const maxBytes = maxSizeMb * 1024 * 1024;
+  if (file.size > maxBytes) {
+    const mb = (file.size / (1024 * 1024)).toFixed(1);
+    return `too large (${mb} MB, limit ${maxSizeMb} MB)`;
+  }
+  return null;
+}
 
 /** Shape returned by `POST /api/documents/upload`. The sanitized filename
  * is distinct from the original filename the user picked; both are stored
@@ -84,42 +112,62 @@ export async function deleteDocument(id: string): Promise<void> {
 export interface UploadOptions {
   file: File;
   signal?: AbortSignal;
+  /** Ratio 0..1 of the request body sent. Reaches 1 before the server answers. */
   onProgress?: (ratio: number) => void;
+  /** Give up if the server has not answered within this window. */
+  timeoutMs?: number;
 }
+
+/** Sanitizing a 50 MB PDF inside the Docker sandbox can take minutes. */
+export const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Upload a single PDF. Uses XHR instead of fetch so we can surface upload
  * progress (fetch does not expose it for request bodies yet in Chrome 141).
+ *
+ * Rejects with `UnauthorizedError` on 401 (after `redirectToLogin`), with
+ * `ApiError` carrying a readable message for every other failure, and with
+ * an `AbortError` DOMException when cancelled.
  */
-export function uploadPdf({ file, signal, onProgress }: UploadOptions): Promise<UploadResponse> {
+export function uploadPdf({
+  file,
+  signal,
+  onProgress,
+  timeoutMs = UPLOAD_TIMEOUT_MS,
+}: UploadOptions): Promise<UploadResponse> {
   return new Promise<UploadResponse>((resolve, reject) => {
     const form = new FormData();
     form.append("file", file, file.name);
 
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/documents/upload", true);
+    xhr.open("POST", apiUrl("/api/documents/upload"), true);
     xhr.withCredentials = true;
     xhr.responseType = "json";
+    xhr.timeout = timeoutMs;
 
     if (onProgress) {
       xhr.upload.onprogress = (ev) => {
-        if (ev.lengthComputable) onProgress(ev.loaded / ev.total);
+        if (ev.lengthComputable) onProgress(Math.min(1, ev.loaded / ev.total));
       };
+      // Body fully sent: the server is now validating + sanitizing.
+      xhr.upload.onload = () => onProgress(1);
     }
 
     xhr.onload = () => {
+      const body: unknown = xhr.response;
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve((xhr.response ?? {}) as UploadResponse);
+        resolve((body ?? {}) as UploadResponse);
       } else if (xhr.status === 401) {
-        reject(new Error("unauthorized"));
+        redirectToLogin();
+        reject(new UnauthorizedError());
       } else {
-        const msg =
-          (xhr.response && (xhr.response.detail || xhr.response.error)) ||
-          `upload failed (${xhr.status})`;
-        reject(new Error(String(msg)));
+        reject(new ApiError(xhr.status, body, errorMessageFromBody(xhr.status, body)));
       }
     };
-    xhr.onerror = () => reject(new Error("network error"));
+    xhr.onerror = () =>
+      reject(new ApiError(0, null, "network error, backend unreachable"));
+    xhr.ontimeout = () =>
+      reject(new ApiError(0, null, `upload timed out after ${Math.round(timeoutMs / 60000)} min`));
     xhr.onabort = () => reject(new DOMException("aborted", "AbortError"));
 
     if (signal) {
