@@ -75,11 +75,12 @@ def get_mongo_db() -> Database:
 def get_pdfs_collection() -> Collection:
     """The single collection holding chunks + embeddings.
 
-    Document shape (per chunk):
+    Document shape (per chunk) — field names must match app.db.vector and
+    app.rag.chunker (DOC_ID_FIELD = "doc_id"); renaming here is a silent break:
         {
           "_id": ObjectId,
           "workspace_id": str,          # for isolation + $search filter
-          "document_id": str,           # Postgres documents.id (UUID str)
+          "doc_id": str,                # Postgres documents.id (UUID str)
           "chunk_index": int,
           "chunk_text": str,
           "page_num": int | None,

@@ -1,12 +1,18 @@
 """MongoDB Atlas index management (idempotent).
 
 Covers T-003, T-008, T-009:
-    1. Regular indexes on `pdfs` (workspace_id, document_id, created_at).
+    1. Regular indexes on `pdfs` (workspace_id, doc_id, created_at).
     2. Atlas Vector Search index — 2048-dim Cohere V5-Pro vectors, cosine.
     3. Atlas $search text index — BM25 scoring on chunk_text.
 
+Canonical chunk field name is `doc_id` (task #27 reconciliation). This matches
+`app.db.vector.DOC_ID_FIELD` — the writer — plus `app.rag.chunker.Chunk.doc_id`,
+`app.rag.rrf` and `app.rag.pipeline` SSE citations. The Postgres column keeps
+its own name `document_id` (`app.db.models.AuditLog.document_id`); Postgres and
+the Mongo chunk field are intentionally separate names.
+
 M0 cap: 3 Atlas Search indexes per cluster. We stay at 2 search indexes
-(vector + text) + regular indexes (which don't count against the search cap).
+(vector + bm25) + regular indexes (which don't count against the search cap).
 
 Run via:  python -m app.db.indices
 """
@@ -24,18 +30,20 @@ from app.db.mongodb import get_pdfs_collection
 log = logging.getLogger(__name__)
 
 VECTOR_INDEX_NAME = "vector_index"
-SEARCH_INDEX_NAME = "text_index"
+# Match app.rag.bm25.BM25_INDEX_NAME — a rename here breaks T-009 queries.
+SEARCH_INDEX_NAME = "bm25_index"
 VECTOR_DIM = 2048  # Cohere Embed V5-Pro default (configurable: 256/512/768/1024/1536/2048)
 
 
 def ensure_regular_indexes(coll: Collection | None = None) -> list[str]:
     """Create non-search indexes (free, don't count against M0 cap of 3)."""
-    coll = coll or get_pdfs_collection()
+    if coll is None:
+        coll = get_pdfs_collection()
     created = []
     created.append(
         coll.create_index(
-            [("workspace_id", 1), ("document_id", 1), ("chunk_index", 1)],
-            name="ix_workspace_document_chunk",
+            [("workspace_id", 1), ("doc_id", 1), ("chunk_index", 1)],
+            name="ix_workspace_doc_chunk",
             background=True,
         )
     )
@@ -48,8 +56,8 @@ def ensure_regular_indexes(coll: Collection | None = None) -> list[str]:
     )
     created.append(
         coll.create_index(
-            [("document_id", 1)],
-            name="ix_document",
+            [("doc_id", 1)],
+            name="ix_doc",
             background=True,
         )
     )
@@ -71,7 +79,8 @@ def ensure_vector_index(coll: Collection | None = None, dim: int = VECTOR_DIM) -
 
     Idempotent: skips if an index of the same name already exists.
     """
-    coll = coll or get_pdfs_collection()
+    if coll is None:
+        coll = get_pdfs_collection()
     if _search_index_exists(coll, VECTOR_INDEX_NAME):
         log.info("vector index %r already exists — skipping", VECTOR_INDEX_NAME)
         return VECTOR_INDEX_NAME
@@ -90,7 +99,7 @@ def ensure_vector_index(coll: Collection | None = None, dim: int = VECTOR_DIM) -
             },
             {
                 "type": "filter",
-                "path": "document_id",
+                "path": "doc_id",
             },
         ]
     }
@@ -110,7 +119,8 @@ def ensure_search_index(coll: Collection | None = None) -> str:
 
     Idempotent: skips if an index of the same name already exists.
     """
-    coll = coll or get_pdfs_collection()
+    if coll is None:
+        coll = get_pdfs_collection()
     if _search_index_exists(coll, SEARCH_INDEX_NAME):
         log.info("search index %r already exists — skipping", SEARCH_INDEX_NAME)
         return SEARCH_INDEX_NAME
@@ -126,7 +136,7 @@ def ensure_search_index(coll: Collection | None = None) -> str:
                 "workspace_id": {
                     "type": "token",
                 },
-                "document_id": {
+                "doc_id": {
                     "type": "token",
                 },
             },
