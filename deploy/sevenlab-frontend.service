@@ -1,0 +1,51 @@
+[Unit]
+Description=SevenLab PDF Chat — Next.js 16 frontend
+Documentation=https://github.com/bosmadev/sevenlab
+After=network-online.target sevenlab-backend.service
+Wants=network-online.target
+# Frontend proxies to the backend; start backend first so the first SSR hit lands.
+
+[Service]
+Type=simple
+User=dennis
+Group=dennis
+WorkingDirectory=/opt/sevenlab/frontend
+
+# Load frontend env (BACKEND_URL=http://127.0.0.1:8001, APP_PASSWORD_HASH,
+# SESSION_SECRET — mirror of backend secrets so middleware HMAC matches).
+EnvironmentFile=/opt/sevenlab/frontend/.env
+Environment=NODE_ENV=production
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3006
+
+# `npm start` runs `next start` which serves the prebuilt .next output.
+# The install.sh script runs `npm run build` once per deploy.
+ExecStart=/usr/bin/npm start
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/opt/sevenlab/frontend/.next
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=256
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sevenlab-frontend
+
+[Install]
+WantedBy=multi-user.target

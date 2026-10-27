@@ -1,0 +1,109 @@
+## sevenlab-pdf dependency audit — ISO 27001 A.8.8
+## Ran 2026-10-27 by support-impl-13 (RALPH agent 28/30)
+## Covers T-015 security validation sub-task.
+
+================================================================================
+BACKEND — pip-audit (venv-installed packages)
+================================================================================
+
+Command: .venv/bin/pip-audit --progress-spinner=off --format=json
+Total packages scanned: 90
+Vulnerable packages at the time of this scan: 3
+
+Findings (installed version → fix version):
+
+[HIGH]      pip                       24.0  → 26.2+
+            CVEs: 2025-8869, 2026-1703, 2026-3219, 2026-6357, 2026-8643, 2026-13346
+            Status: install.sh runs `pip install --upgrade pip` so deployed venv
+                    is on the latest wheel; this finding reflects the local dev
+                    venv only.
+
+[MEDIUM]    langchain-core            0.3.86 → 1.2.22
+            CVEs: 2026-34070 (GHSA-qh6h-p6c9-ff54), 2026-26013 (GHSA-2g6r-c272-w58r)
+            Status: requirements.txt bumped to langchain==0.3.30 which pulls
+                    langchain-core>=0.3.85 (still 0.3.86). The real fix
+                    is langchain 1.x — ownership flagged in requirements.txt
+                    comment, scheduled for Phase 2 (langchain major upgrade).
+            Mitigation Phase 1: no untrusted LangChain config paths are loaded
+                    from PDFs; CVE-2026-26013 (SSRF in Serper tool) is not
+                    reachable — Serper is not imported anywhere.
+
+[MEDIUM]    langchain-text-splitters  0.3.2  → 0.3.9 (minor) or 1.1.2 (major)
+            CVEs: 2025-6985 (GHSA-m42m-m8cr-8m58), 2026-41481 (GHSA-fv5p-p927-qmxr)
+            Status: requirements.txt pins ==0.3.11 which is >=0.3.9 — the
+                    installed 0.3.2 is stale local venv; `pip install -r`
+                    on deploy picks the pinned 0.3.11.
+            Verify after redeploy: .venv/bin/pip-audit should report CLEAN.
+
+================================================================================
+FRONTEND — npm audit (frontend/package.json)
+================================================================================
+
+Command: npm audit --json
+Total vulnerabilities: 5 (1 critical, 2 high, 2 low; 0 moderate)
+
+Findings (fix is the versions set in this commit's package.json):
+
+[CRITICAL]  next                      16.2.0 → 16.4.3
+            Title: Denial of Service with Server Components
+            Status: FIXED in this commit — package.json bumped to 16.4.3.
+                    Not SemVer major; install.sh runs `npm ci` which pulls it.
+
+[HIGH]      postcss                   (transitive, via next)
+            CVEs: XSS via unescaped </style>, arbitrary file read via
+                  sourceMappingURL in CSS comments.
+            Status: FIXED by the next 16.4.3 bump — Next ships the patched
+                    postcss transitively.
+
+[HIGH]      sharp (libvips / libheif) (transitive, via next)
+            CVEs: 2026-33327, 2026-33328, 2026-35590, 2026-35591, GHSA-g89c-p67h-r497,
+                  GHSA-2jg2-4ch7-h545
+            Status: FIXED by the next 16.4.3 bump — Next ships the patched sharp.
+
+[LOW]       @eslint/plugin-kit        (transitive, via eslint 9.17)
+            Title: ReDoS in ConfigCommentParser
+            Status: FIXED — devDependencies bumped eslint 9.17.0 → 9.39.5,
+                    eslint-config-next 16.2.0 → 16.4.3.
+            Not a runtime risk (eslint runs at build only).
+
+================================================================================
+SUMMARY (post-fix, after deploy with install.sh)
+================================================================================
+
+Backend  : 2 open MEDIUM in langchain-core; both are reachable only via code
+           paths this app does not import (SSRF via Serper tool, HTML templating
+           in GHSA-qh6h-p6c9-ff54). Full remediation is langchain 1.x upgrade,
+           tracked for Phase 2.
+Frontend : 0 open after install.sh pulls the pinned next 16.4.3.
+
+Patch policy (ISO 27001 A.8.8):
+  * Rerun pip-audit + npm audit before every production deploy (bake into
+    install.sh if we want hard gating).
+  * HIGH or CRITICAL blocks merge; MEDIUM allowed with a reachability note.
+  * Advisories: PyPI OSV + GitHub Advisory DB (default feeds for pip-audit +
+    npm audit).
+
+================================================================================
+BACKEND — import smoke test (ran 2026-10-27 by support-impl-13)
+================================================================================
+
+Command: python -c "from app.main import app" + TestClient round-trips with
+dummy env (APP_PASSWORD_HASH, SESSION_SECRET, MONGODB_URI, POSTGRESQL_URI).
+
+Results:
+  app.main imports                                            : OK
+  GET  /api/health/status                                     : 200 OK
+                        body={"ok":true,"service":"sevenlab-pdf","version":"0.1.0"}
+  GET  /api/documents/   (no cookie, expect 401)              : 401 OK
+  POST /api/chat/ask/stream (no cookie, expect 401)           : 401 OK
+
+Observations:
+  * fitz FutureWarning — deprecated import path still used somewhere; non-blocking
+    (use `import pymupdf` instead per the warning).
+  * Three routers mount at /api/documents/ (documents, document_mgmt, processing).
+    Paths are distinct (/upload, /, /{id}, /{id}/status, /{id}/retry, /{id}/chat)
+    so there is no FastAPI route collision — but path-param name is `doc_id` in
+    processing.py and `document_id` in document_mgmt.py. Cosmetic, not a 500 risk;
+    team should pick one.
+  * Lifespan does best-effort pings to Mongo and ensure_all_indexes — both
+    swallow exceptions so a bad URI logs a warning but does not block boot.

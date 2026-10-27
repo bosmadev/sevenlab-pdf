@@ -1,0 +1,60 @@
+[Unit]
+Description=SevenLab PDF Chat — FastAPI backend (uvicorn)
+Documentation=https://github.com/bosmadev/sevenlab
+After=network-online.target
+Wants=network-online.target
+# Service degrades gracefully if Mongo/Postgres are offline; no hard dep.
+
+[Service]
+Type=simple
+User=dennis
+Group=dennis
+WorkingDirectory=/opt/sevenlab/backend
+
+# Load secrets (APP_PASSWORD_HASH, AZURE_AI_API_KEY, MONGODB_URI, POSTGRESQL_URI,
+# SESSION_SECRET). File must be 0600 and owned by the User= account.
+EnvironmentFile=/opt/sevenlab/backend/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Bind 127.0.0.1 — Caddy fronts TLS and routes /api/* to this port.
+ExecStart=/opt/sevenlab/backend/.venv/bin/uvicorn \
+    app.main:app \
+    --host 127.0.0.1 \
+    --port 8001 \
+    --workers 4 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1 \
+    --log-level info
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+# Hardening — PDF processing runs sandboxed in Docker (app/services/pdf_sandbox.py),
+# so the backend itself only needs the venv and the .env file writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/opt/sevenlab/backend/logs /tmp/uploads
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# Resource caps (plan § Processing security: 2GB per worker, 500 pages, 5m timeout).
+MemoryHigh=6G
+MemoryMax=8G
+TasksMax=512
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sevenlab-backend
+
+[Install]
+WantedBy=multi-user.target

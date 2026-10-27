@@ -1,0 +1,59 @@
+## sevenlab.bosma.dev — Caddy snippet
+##
+## Install:
+##   sudo cp Caddyfile.sevenlab /etc/caddy/conf.d/sevenlab.caddy
+##   sudo systemctl reload caddy
+##
+## The main /etc/caddy/Caddyfile must `import conf.d/*.caddy` for this to load.
+
+sevenlab.bosma.dev {
+    # TLS via Cloudflare DNS-01 (bosmadev wildcard pattern).
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+
+    # SSE streams must not be buffered — the Next.js frontend proxies
+    # /api/chat/ask/stream straight through, but Caddy would still buffer
+    # unless we flush. Backend sends X-Accel-Buffering: no, which Caddy
+    # honours when flush_interval is -1 on the matching route.
+    @sse path /api/chat/ask/stream
+    reverse_proxy @sse 127.0.0.1:8001 {
+        flush_interval -1
+        transport http {
+            response_header_timeout 300s
+        }
+    }
+
+    # Backend API — everything under /api/* goes to FastAPI on 8001.
+    @api path /api/*
+    reverse_proxy @api 127.0.0.1:8001 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote_host}
+    }
+
+    # Everything else is Next.js SSR on 3006.
+    reverse_proxy 127.0.0.1:3006 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote_host}
+    }
+
+    # Security headers — mirrors scraper.bosma.dev's hardening.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        # Remove Caddy's default Server header.
+        -Server
+    }
+
+    # Access + error log to the usual place; journald picks it up.
+    log {
+        output file /var/log/caddy/sevenlab.log {
+            roll_size 50mb
+            roll_keep 10
+        }
+        format json
+    }
+}
