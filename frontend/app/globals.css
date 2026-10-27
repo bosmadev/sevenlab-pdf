@@ -1,14 +1,82 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --background: #0a0a0a;
-  --foreground: #e5e5e5;
+  --bg-base: #0b0e11;
+  --bg-surface: #12161c;
+  --bg-elevated: #1a1f28;
+  --bg-overlay: #232a35;
+
+  --border-default: #2a3040;
+  --border-hover: #3d4a5c;
+  --border-active: #94a3b8;
+
+  --text-primary: #c9d1d9;
+  --text-secondary: #a6b2c0;
+  --text-muted: #929faf;
+  --text-bright: #e6edf3;
+
+  --accent: #94a3b8;
+  --accent-dim: rgba(148, 163, 184, 0.1);
+  --accent-glow: rgba(148, 163, 184, 0.2);
+
+  --success-color: #4ade80;
+  --danger-color: #f87171;
+  --warning-color: #fbbf24;
+  --info-color: #60a5fa;
+
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", ui-monospace, monospace;
+  --font-size-xs: 0.6875rem;
+  --font-size-sm: 0.8125rem;
+  --font-size-base: 0.875rem;
+  --font-size-lg: 1rem;
+  --font-size-xl: 1.25rem;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 html, body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-width: 100vw;
+  overflow-x: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  line-height: 1.6;
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+
+/* Terminal-style blinking caret for assistant streaming */
+@keyframes tuiCaret {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+.tui-caret::after {
+  content: "\25AE";
+  margin-left: 2px;
+  color: var(--accent);
+  animation: tuiCaret 1s steps(1) infinite;
 }
