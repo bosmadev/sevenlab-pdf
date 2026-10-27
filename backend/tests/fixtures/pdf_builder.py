@@ -96,6 +96,21 @@ def make_encrypted_pdf(password: str = "secret") -> bytes:
     return buf.getvalue()
 
 
+def make_owner_encrypted_pdf(owner_password: str = "owner-secret") -> bytes:
+    """Return a PDF with an owner password but an EMPTY user password.
+
+    pikepdf opens this without raising PasswordError, so only an explicit
+    ``is_encrypted`` check catches it — the sanitizer must still reject it.
+    """
+    pdf = _one_page_pdf()
+    buf = io.BytesIO()
+    pdf.save(
+        buf,
+        encryption=pikepdf.Encryption(owner=owner_password, user="", R=4),
+    )
+    return buf.getvalue()
+
+
 def make_pdf_with_leading_junk(junk_bytes: int = 512) -> bytes:
     """A valid PDF with ``junk_bytes`` of garbage before the ``%PDF-`` header.
 
@@ -115,6 +130,7 @@ __all__ = [
     "make_clean_pdf",
     "make_malicious_pdf",
     "make_encrypted_pdf",
+    "make_owner_encrypted_pdf",
     "make_pdf_with_leading_junk",
     "make_pdf_truncated_header",
 ]

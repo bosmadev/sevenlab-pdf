@@ -15,6 +15,7 @@ import pytest
 
 from app.services.pdf_sanitizer import (
     DANGEROUS_KEYS,
+    ENCRYPTED_REJECT_MESSAGE,
     PdfSanitizationError,
     sanitize_pdf,
 )
@@ -22,6 +23,7 @@ from tests.fixtures.pdf_builder import (
     make_clean_pdf,
     make_encrypted_pdf,
     make_malicious_pdf,
+    make_owner_encrypted_pdf,
     make_pdf_with_leading_junk,
 )
 
@@ -135,4 +137,20 @@ class TestSanitizeErrors:
     def test_encrypted_rejected(self) -> None:
         with pytest.raises(PdfSanitizationError) as exc:
             sanitize_pdf(make_encrypted_pdf("secret"))
-        assert "encrypted" in str(exc.value).lower()
+        assert str(exc.value) == ENCRYPTED_REJECT_MESSAGE
+
+    def test_owner_only_encrypted_rejected(self) -> None:
+        """Owner password + empty user password opens without PasswordError.
+
+        pikepdf reports ``is_encrypted=True`` but never raises, so this is
+        the path the original check missed. Must be rejected with the same
+        message as a user-password PDF.
+        """
+        owner_only = make_owner_encrypted_pdf()
+        # Prove the fixture is the tricky shape: it opens with no password.
+        with pikepdf.open(io.BytesIO(owner_only)) as pdf:
+            assert pdf.is_encrypted is True
+
+        with pytest.raises(PdfSanitizationError) as exc:
+            sanitize_pdf(owner_only)
+        assert str(exc.value) == ENCRYPTED_REJECT_MESSAGE

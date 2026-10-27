@@ -33,6 +33,9 @@ DANGEROUS_KEYS: Final[tuple[str, ...]] = (
 )
 
 
+ENCRYPTED_REJECT_MESSAGE: Final[str] = "Password-protected PDFs are not allowed"
+
+
 class PdfSanitizationError(Exception):
     """Raised when a PDF cannot be opened, is encrypted, or sanitation fails."""
 
@@ -86,11 +89,17 @@ def sanitize_pdf(pdf_bytes: bytes) -> tuple[bytes, SanitizationReport]:
     try:
         pdf = pikepdf.open(io.BytesIO(pdf_bytes))
     except pikepdf.PasswordError as exc:
-        raise PdfSanitizationError("encrypted PDFs are rejected") from exc
+        raise PdfSanitizationError(ENCRYPTED_REJECT_MESSAGE) from exc
     except Exception as exc:  # noqa: BLE001 — upstream raises many types
         raise PdfSanitizationError(f"cannot parse PDF: {exc}") from exc
 
-    was_encrypted = pdf.is_encrypted
+    # Owner-only encryption opens with an empty user password, so
+    # PasswordError never fires — check the flag explicitly.
+    if pdf.is_encrypted:
+        pdf.close()
+        raise PdfSanitizationError(ENCRYPTED_REJECT_MESSAGE)
+
+    was_encrypted = False
 
     with pdf:
         try:
