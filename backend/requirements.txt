@@ -1,0 +1,46 @@
+# FastAPI + ASGI
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.19
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# PostgreSQL (SQLAlchemy sync + async)
+sqlalchemy[asyncio]==2.0.36
+psycopg[binary]==3.2.3
+alembic==1.14.0
+
+# MongoDB Atlas + GridFS
+pymongo[srv]==4.10.1
+motor==3.6.0
+
+# Auth / security
+bcrypt==4.2.1
+python-jose[cryptography]==3.3.0
+passlib==1.7.4
+
+# AI/embeddings
+cohere==5.13.3
+requests==2.32.3
+httpx==0.28.1
+
+# PDF parsing
+pymupdf==1.25.1
+pdfplumber==0.11.4
+pikepdf==9.4.2
+
+# OCR
+pytesseract==0.3.13
+pillow==11.0.0
+
+# Chunking
+langchain==0.3.11
+langchain-text-splitters==0.3.3
+
+# Observability
+python-json-logger==2.0.7
+
+# Dev
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pip-audit==2.7.3

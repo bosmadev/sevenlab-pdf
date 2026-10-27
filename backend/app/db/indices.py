@@ -1,0 +1,189 @@
+"""MongoDB Atlas index management (idempotent).
+
+Covers T-003, T-008, T-009:
+    1. Regular indexes on `pdfs` (workspace_id, document_id, created_at).
+    2. Atlas Vector Search index — 2048-dim Cohere V5-Pro vectors, cosine.
+    3. Atlas $search text index — BM25 scoring on chunk_text.
+
+M0 cap: 3 Atlas Search indexes per cluster. We stay at 2 search indexes
+(vector + text) + regular indexes (which don't count against the search cap).
+
+Run via:  python -m app.db.indices
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from pymongo.collection import Collection
+from pymongo.errors import OperationFailure
+
+from app.db.mongodb import get_pdfs_collection
+
+log = logging.getLogger(__name__)
+
+VECTOR_INDEX_NAME = "vector_index"
+SEARCH_INDEX_NAME = "text_index"
+VECTOR_DIM = 2048  # Cohere Embed V5-Pro default (configurable: 256/512/768/1024/1536/2048)
+
+
+def ensure_regular_indexes(coll: Collection | None = None) -> list[str]:
+    """Create non-search indexes (free, don't count against M0 cap of 3)."""
+    coll = coll or get_pdfs_collection()
+    created = []
+    created.append(
+        coll.create_index(
+            [("workspace_id", 1), ("document_id", 1), ("chunk_index", 1)],
+            name="ix_workspace_document_chunk",
+            background=True,
+        )
+    )
+    created.append(
+        coll.create_index(
+            [("workspace_id", 1), ("created_at", -1)],
+            name="ix_workspace_created",
+            background=True,
+        )
+    )
+    created.append(
+        coll.create_index(
+            [("document_id", 1)],
+            name="ix_document",
+            background=True,
+        )
+    )
+    return created
+
+
+def _search_index_exists(coll: Collection, name: str) -> bool:
+    try:
+        existing = list(coll.list_search_indexes())
+    except OperationFailure as e:
+        # listSearchIndexes requires Atlas Search tier
+        log.warning("list_search_indexes failed (not on Atlas Search?): %s", e)
+        return False
+    return any(idx.get("name") == name for idx in existing)
+
+
+def ensure_vector_index(coll: Collection | None = None, dim: int = VECTOR_DIM) -> str:
+    """Create Atlas Vector Search index on `embedding` field (2048-dim, cosine).
+
+    Idempotent: skips if an index of the same name already exists.
+    """
+    coll = coll or get_pdfs_collection()
+    if _search_index_exists(coll, VECTOR_INDEX_NAME):
+        log.info("vector index %r already exists — skipping", VECTOR_INDEX_NAME)
+        return VECTOR_INDEX_NAME
+
+    definition = {
+        "fields": [
+            {
+                "type": "vector",
+                "path": "embedding",
+                "numDimensions": dim,
+                "similarity": "cosine",
+            },
+            {
+                "type": "filter",
+                "path": "workspace_id",
+            },
+            {
+                "type": "filter",
+                "path": "document_id",
+            },
+        ]
+    }
+    coll.create_search_index(
+        {
+            "name": VECTOR_INDEX_NAME,
+            "type": "vectorSearch",
+            "definition": definition,
+        }
+    )
+    log.info("created vector index %r (%d-dim, cosine)", VECTOR_INDEX_NAME, dim)
+    return VECTOR_INDEX_NAME
+
+
+def ensure_search_index(coll: Collection | None = None) -> str:
+    """Create Atlas $search text index on chunk_text (BM25 scoring built-in).
+
+    Idempotent: skips if an index of the same name already exists.
+    """
+    coll = coll or get_pdfs_collection()
+    if _search_index_exists(coll, SEARCH_INDEX_NAME):
+        log.info("search index %r already exists — skipping", SEARCH_INDEX_NAME)
+        return SEARCH_INDEX_NAME
+
+    definition = {
+        "mappings": {
+            "dynamic": False,
+            "fields": {
+                "chunk_text": {
+                    "type": "string",
+                    "analyzer": "lucene.standard",
+                },
+                "workspace_id": {
+                    "type": "token",
+                },
+                "document_id": {
+                    "type": "token",
+                },
+            },
+        }
+    }
+    coll.create_search_index(
+        {
+            "name": SEARCH_INDEX_NAME,
+            "type": "search",
+            "definition": definition,
+        }
+    )
+    log.info("created text search index %r", SEARCH_INDEX_NAME)
+    return SEARCH_INDEX_NAME
+
+
+def wait_for_index_ready(coll: Collection, name: str, timeout_s: int = 300) -> bool:
+    """Poll until the named search index reports status READY (or timeout)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            indexes = list(coll.list_search_indexes(name))
+        except OperationFailure:
+            return False
+        for idx in indexes:
+            if idx.get("name") == name and idx.get("status") == "READY":
+                return True
+        time.sleep(5)
+    return False
+
+
+def ensure_all_indexes(wait: bool = False) -> dict:
+    """Create every index needed for the pdfs collection. Returns a summary."""
+    coll = get_pdfs_collection()
+    regular = ensure_regular_indexes(coll)
+    vector = ensure_vector_index(coll)
+    text = ensure_search_index(coll)
+    summary = {
+        "regular_indexes": regular,
+        "vector_index": vector,
+        "search_index": text,
+    }
+    if wait:
+        summary["vector_ready"] = wait_for_index_ready(coll, vector)
+        summary["search_ready"] = wait_for_index_ready(coll, text)
+    return summary
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    try:
+        result = ensure_all_indexes(wait="--wait" in sys.argv)
+        print(json.dumps(result, default=str, indent=2))
+    except Exception as e:
+        log.exception("index creation failed")
+        print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)
+        sys.exit(1)
