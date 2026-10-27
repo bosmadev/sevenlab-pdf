@@ -4,8 +4,10 @@ Skipped unless MONGODB_URI is exported — these touch the real cluster
 `sevenlab.bsbpajx.mongodb.net` and exercise the two search indexes created
 by `app.db.indices`:
 
-    - vector_index  (2048-dim, cosine, workspace_id + document_id filters)
-    - bm25_index    (lucene.standard, workspace_id + document_id tokens)
+    - vector_index  (2048-dim, cosine, workspace_id + doc_id filters)
+    - bm25_index    (lucene.standard, workspace_id + doc_id tokens)
+
+Chunk field is `doc_id` (task #27 reconciliation, see app.db.vector.DOC_ID_FIELD).
 
 Isolation: every write is tagged with workspace_id="_t003_integration" and
 cleaned up in the fixture teardown. The regular pdfs data is never touched.
@@ -43,10 +45,10 @@ def pdfs_collection():
     coll.delete_many({"workspace_id": TEST_WORKSPACE})
 
 
-def _chunk(document_id: str, chunk_index: int, text: str, embedding: list[float]) -> dict:
+def _chunk(doc_id: str, chunk_index: int, text: str, embedding: list[float]) -> dict:
     return {
         "workspace_id": TEST_WORKSPACE,
-        "document_id": document_id,
+        "doc_id": doc_id,
         "chunk_index": chunk_index,
         "chunk_text": text,
         "page_num": 1,
@@ -205,8 +207,33 @@ def test_gridfs_round_trip() -> None:
 def test_regular_indexes_present(pdfs_collection) -> None:
     names = {i["name"] for i in pdfs_collection.list_indexes()}
     for expected in (
-        "ix_workspace_document_chunk",
+        "ix_workspace_doc_chunk",
         "ix_workspace_created",
-        "ix_document",
+        "ix_doc",
     ):
         assert expected in names, f"missing regular index {expected}; have {names}"
+
+
+def test_chats_and_gridfs_indexes_present() -> None:
+    """`ensure_all_indexes` also covers `chats` and the GridFS bucket."""
+    from app.db.indices import (
+        CHATS_INDEX_NAME,
+        GRIDFS_BUCKET,
+        GRIDFS_WORKSPACE_INDEX_NAME,
+        ensure_chats_indexes,
+        ensure_gridfs_indexes,
+    )
+    from app.db.mongodb import get_chats_collection, get_mongo_db
+
+    ensure_chats_indexes()
+    ensure_gridfs_indexes()
+
+    chat_names = {i["name"] for i in get_chats_collection().list_indexes()}
+    assert CHATS_INDEX_NAME in chat_names, chat_names
+
+    db = get_mongo_db()
+    file_names = {i["name"] for i in db[f"{GRIDFS_BUCKET}.files"].list_indexes()}
+    assert "filename_1_uploadDate_1" in file_names, file_names
+    assert GRIDFS_WORKSPACE_INDEX_NAME in file_names, file_names
+    chunk_names = {i["name"] for i in db[f"{GRIDFS_BUCKET}.chunks"].list_indexes()}
+    assert "files_id_1_n_1" in chunk_names, chunk_names

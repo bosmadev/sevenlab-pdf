@@ -26,6 +26,7 @@ from typing import Any
 from bson import ObjectId
 from pymongo import ASCENDING, DESCENDING
 
+from app.db.indices import CHATS_INDEX_NAME
 from app.db.mongodb import get_chats_collection
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ def _ensure_index() -> None:
                     ("document_id", ASCENDING),
                     ("created_at", ASCENDING),
                 ],
-                name="chats_wks_doc_time",
+                name=CHATS_INDEX_NAME,
                 background=True,
             )
         except Exception as exc:  # pragma: no cover — logged, not fatal

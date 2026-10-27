@@ -4,6 +4,9 @@ Covers T-003, T-008, T-009:
     1. Regular indexes on `pdfs` (workspace_id, doc_id, created_at).
     2. Atlas Vector Search index — 2048-dim Cohere V5-Pro vectors, cosine.
     3. Atlas $search text index — BM25 scoring on chunk_text.
+    4. `chats` history index (workspace_id, document_id, created_at).
+    5. GridFS `pdf_files` bucket indexes — the two pymongo defaults plus a
+       (metadata.workspace_id, uploadDate) index for per-workspace listing.
 
 Canonical chunk field name is `doc_id` (task #27 reconciliation). This matches
 `app.db.vector.DOC_ID_FIELD` — the writer — plus `app.rag.chunker.Chunk.doc_id`,
@@ -23,9 +26,10 @@ import logging
 import time
 
 from pymongo.collection import Collection
+from pymongo.database import Database
 from pymongo.errors import OperationFailure
 
-from app.db.mongodb import get_pdfs_collection
+from app.db.mongodb import get_chats_collection, get_mongo_db, get_pdfs_collection
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +37,11 @@ VECTOR_INDEX_NAME = "vector_index"
 # Match app.rag.bm25.BM25_INDEX_NAME — a rename here breaks T-009 queries.
 SEARCH_INDEX_NAME = "bm25_index"
 VECTOR_DIM = 2048  # Cohere Embed V5-Pro default (configurable: 256/512/768/1024/1536/2048)
+# Shared with app.services.chat_history._ensure_index — one name, two callers.
+CHATS_INDEX_NAME = "chats_wks_doc_time"
+# Must equal the `collection=` passed to GridFS() in app.db.mongodb.get_gridfs.
+GRIDFS_BUCKET = "pdf_files"
+GRIDFS_WORKSPACE_INDEX_NAME = "ix_files_workspace_upload"
 
 
 def ensure_regular_indexes(coll: Collection | None = None) -> list[str]:
@@ -58,6 +67,47 @@ def ensure_regular_indexes(coll: Collection | None = None) -> list[str]:
         coll.create_index(
             [("doc_id", 1)],
             name="ix_doc",
+            background=True,
+        )
+    )
+    return created
+
+
+def ensure_chats_indexes(coll: Collection | None = None) -> list[str]:
+    """Chronological-read index for `chats` (see app.services.chat_history)."""
+    if coll is None:
+        coll = get_chats_collection()
+    return [
+        coll.create_index(
+            [("workspace_id", 1), ("document_id", 1), ("created_at", 1)],
+            name=CHATS_INDEX_NAME,
+            background=True,
+        )
+    ]
+
+
+def ensure_gridfs_indexes(db: Database | None = None) -> list[str]:
+    """Indexes on the `pdf_files` GridFS bucket.
+
+    pymongo only creates its two default indexes lazily on the first `put()`
+    into an EMPTY bucket, so a bucket restored from a dump or created by hand
+    never gets them. The default key specs are repeated here WITHOUT custom
+    names so they match what pymongo would create (same keys + different name
+    is an IndexOptionsConflict on the server). The third index backs
+    `app.services.gridfs_storage.list_pdfs`, which filters on
+    `metadata.workspace_id` and sorts on `uploadDate` descending.
+    """
+    if db is None:
+        db = get_mongo_db()
+    files = db[f"{GRIDFS_BUCKET}.files"]
+    chunks = db[f"{GRIDFS_BUCKET}.chunks"]
+    created = []
+    created.append(files.create_index([("filename", 1), ("uploadDate", 1)]))
+    created.append(chunks.create_index([("files_id", 1), ("n", 1)], unique=True))
+    created.append(
+        files.create_index(
+            [("metadata.workspace_id", 1), ("uploadDate", -1)],
+            name=GRIDFS_WORKSPACE_INDEX_NAME,
             background=True,
         )
     )
@@ -174,10 +224,14 @@ def ensure_all_indexes(wait: bool = False) -> dict:
     regular = ensure_regular_indexes(coll)
     vector = ensure_vector_index(coll)
     text = ensure_search_index(coll)
+    chats = ensure_chats_indexes()
+    gridfs = ensure_gridfs_indexes()
     summary = {
         "regular_indexes": regular,
         "vector_index": vector,
         "search_index": text,
+        "chats_indexes": chats,
+        "gridfs_indexes": gridfs,
     }
     if wait:
         summary["vector_ready"] = wait_for_index_ready(coll, vector)

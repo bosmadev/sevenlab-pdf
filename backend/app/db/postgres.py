@@ -76,7 +76,14 @@ def get_db() -> Iterator[Session]:
 
 
 def init_schema() -> None:
-    """Create all tables defined on Base.metadata (idempotent)."""
-    from app.db import models  # noqa: F401 — register models with Base
+    """Bring the schema to the Alembic head revision (idempotent).
 
-    Base.metadata.create_all(bind=engine())
+    Replaces the Phase-1 `Base.metadata.create_all` so a fresh database is
+    stamped in `alembic_version` and later `alembic upgrade head` runs do not
+    collide with pre-existing tables.
+    """
+    from app.db import models  # noqa: F401 — register models with Base
+    from app.db.migrate import upgrade_to_head
+
+    with engine().connect() as conn:
+        upgrade_to_head(connection=conn)
