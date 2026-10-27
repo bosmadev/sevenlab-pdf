@@ -22,8 +22,10 @@ of a traceback, so the chat UI can show a graceful message.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -88,10 +90,10 @@ async def _retrieve(
     top_k: int,
     doc_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Call the hybrid retriever owned by T-010. Isolates the import so a
-    missing module during interleaved Ralph iterations surfaces as a clean
-    SSE error, not a 500. If the retriever's signature does not accept
-    `doc_id` yet (interim version), fall back to a workspace-wide search.
+    """Call the hybrid retriever (T-010). The import is isolated so a
+    missing module surfaces as a clean SSE error, not a 500. ``doc_id`` is
+    always forwarded — silently dropping it would widen a per-document
+    chat to the whole workspace.
     """
     try:
         from app.rag.retriever import hybrid_search  # type: ignore[attr-defined]
@@ -100,15 +102,69 @@ async def _retrieve(
             "hybrid_search not available — T-010 (hybrid-impl-1) must land first"
         ) from e
 
-    try:
-        result = hybrid_search(
-            workspace_id=workspace_id, query=question, top_k=top_k, doc_id=doc_id
-        )
-    except TypeError:
-        result = hybrid_search(workspace_id=workspace_id, query=question, top_k=top_k)
+    result = hybrid_search(
+        workspace_id=workspace_id, query=question, top_k=top_k, doc_id=doc_id
+    )
     if hasattr(result, "__await__"):
         result = await result  # type: ignore[assignment]
     return list(result)
+
+
+def _lookup_filenames(doc_ids: list[str]) -> dict[str, str]:
+    """Map Mongo chunk ``doc_id`` values to the uploaded filename via Postgres.
+
+    Chunks store only the parent ``doc_id`` (``documents.id`` as a UUID
+    string); the human-readable name lives in ``documents.original_filename``.
+    One indexed ``IN`` query per chat turn covers every cited document.
+    """
+    ids: list[uuid.UUID] = []
+    for raw in doc_ids:
+        try:
+            ids.append(uuid.UUID(str(raw)))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    if not ids:
+        return {}
+
+    from sqlalchemy import select
+
+    from app.db.models import Document
+    from app.db.postgres import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(Document.id, Document.original_filename, Document.sanitized_filename)
+            .where(Document.id.in_(ids))
+        ).all()
+    finally:
+        db.close()
+    return {
+        str(doc_id): (original or sanitized)
+        for doc_id, original, sanitized in rows
+        if original or sanitized
+    }
+
+
+async def _attach_filenames(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fill ``filename`` on chunks that lack it. Best-effort: a Postgres
+    failure degrades citations to the literal "document", never the turn."""
+    missing = sorted(
+        {str(c["doc_id"]) for c in chunks if c.get("doc_id") and not c.get("filename")}
+    )
+    if not missing:
+        return chunks
+    try:
+        names = await asyncio.to_thread(_lookup_filenames, missing)
+    except Exception as e:  # noqa: BLE001 — citations are cosmetic, the answer is not
+        logger.warning("rag: filename lookup failed, citations fall back to 'document': %s", e)
+        return chunks
+    for c in chunks:
+        if not c.get("filename"):
+            name = names.get(str(c.get("doc_id")))
+            if name:
+                c["filename"] = name
+    return chunks
 
 
 async def answer_stream(
@@ -131,6 +187,7 @@ async def answer_stream(
         yield _sse({"type": "error", "message": f"retrieval failed: {e}"})
         return
 
+    chunks = await _attach_filenames(chunks)
     context_block, citations = _format_context(chunks, s.rag_max_context_chars)
     yield _sse({"type": "citations", "citations": citations})
 

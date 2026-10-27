@@ -67,6 +67,20 @@ def test_payload_preserved_and_prefers_richer():
     assert out[0].payload["chunk_text"] == "hello"
 
 
+def test_payload_merge_keeps_both_retriever_scores():
+    """A hit seen by vector AND bm25 must carry both scores, not just the first."""
+    vec = RankedHit(id="a", payload={"_id": "a", "vector_score": 0.9, "bm25_score": None})
+    bm = RankedHit(id="a", payload={"_id": "a", "vector_score": None, "bm25_score": 7.3})
+    out = reciprocal_rank_fusion({"vector": [vec], "bm25": [bm]}, k=60)
+    assert out[0].payload["vector_score"] == 0.9
+    assert out[0].payload["bm25_score"] == 7.3
+    # First-seen non-None values are never overwritten by later rankers.
+    vec2 = RankedHit(id="b", payload={"_id": "b", "chunk_text": "first"})
+    bm2 = RankedHit(id="b", payload={"_id": "b", "chunk_text": "second"})
+    out2 = reciprocal_rank_fusion({"vector": [vec2], "bm25": [bm2]}, k=60)
+    assert out2[0].payload["chunk_text"] == "first"
+
+
 def test_rankings_from_payloads_adapter():
     docs = [{"_id": "1", "chunk_text": "hi"}, {"_id": "2", "chunk_text": "bye"}]
     wrapped = rankings_from_payloads({"vector": docs})

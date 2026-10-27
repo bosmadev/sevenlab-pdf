@@ -41,6 +41,19 @@ class FusedHit:
     sources: tuple[str, ...]  # which rankers contributed
 
 
+def _merge_payload(existing: Mapping | None, incoming: Mapping | None) -> Mapping | None:
+    """First-seen payload wins; keys it lacks (or holds as None) are filled from later ones."""
+    if incoming is None:
+        return existing
+    if existing is None:
+        return incoming
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if merged.get(key) is None and value is not None:
+            merged[key] = value
+    return merged
+
+
 def reciprocal_rank_fusion(
     rankings: Mapping[str, Sequence[RankedHit]],
     *,
@@ -83,10 +96,10 @@ def reciprocal_rank_fusion(
             else:
                 bucket["score"] += contribution
                 bucket["sources"].append(ranker_name)
-                # Prefer the richest payload seen (vector hits usually
-                # carry the chunk doc with metadata; BM25 may be lighter).
-                if bucket["payload"] is None and hit.payload is not None:
-                    bucket["payload"] = hit.payload
+                # Keep the first-seen payload but fill in keys it lacks from
+                # later rankers, so a hit found by BOTH retrievers carries
+                # both its vector_score and its bm25_score forward.
+                bucket["payload"] = _merge_payload(bucket["payload"], hit.payload)
 
     fused = [
         FusedHit(

@@ -147,7 +147,7 @@ class HybridRetriever:
     # Optional injection points — unit tests swap these for fakes.
     embed_query_fn: Any = None          # async (text, dimension=None) -> list[float]
     vector_search_fn: Any = None        # sync (workspace, qvec, top_k, doc_id?) -> list[dict]
-    bm25_search_fn: Any = None          # sync (workspace, q, top_k) -> list[BM25Hit]
+    bm25_search_fn: Any = None          # sync (workspace, q, top_k, doc_id=None) -> list[BM25Hit]
     rerank_fn: Any = None               # sync (query, candidates, top_k, model, device) -> list
 
     def _embed(self):
@@ -211,6 +211,7 @@ class HybridRetriever:
             workspace_id,
             q,
             self.bm25_top_k,
+            doc_id=doc_id,
         )
         vec_hits_raw, bm25_hits_raw = await asyncio.gather(
             vec_task, bm25_task, return_exceptions=True
@@ -229,9 +230,9 @@ class HybridRetriever:
         else:
             bm25_payloads = _bm25_hits_to_payloads(bm25_hits_raw)
 
-        # Optional post-filter when caller scopes to one document and
-        # bm25_search did not accept the filter (BM25 helper currently
-        # has no doc filter — this keeps the result workspace+doc clean).
+        # Both retrievers filter on doc_id server-side. This post-filter is
+        # defence in depth for injected search functions that ignore the
+        # kwarg, so a per-document chat can never leak sibling documents.
         if doc_id is not None:
             bm25_payloads = [p for p in bm25_payloads if p["doc_id"] == doc_id]
 

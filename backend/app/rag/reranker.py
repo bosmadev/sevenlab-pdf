@@ -98,6 +98,38 @@ class _CrossEncoderSingleton:
         return [float(s) for s in scores]
 
 
+def resolve_model_name(model_name: str | None = None) -> str:
+    """Explicit arg > ``RERANKER_MODEL`` env > BGE default."""
+    return model_name or os.getenv("RERANKER_MODEL", DEFAULT_RERANKER_MODEL)
+
+
+def preload(
+    *,
+    model_name: str | None = None,
+    device: str | None = None,
+    max_length: int = DEFAULT_RERANKER_MAX_LEN,
+) -> str:
+    """Load the cross-encoder ahead of the first query.
+
+    The model is ~2.3 GB and is NOT bundled, so an un-warmed process pays
+    the full download plus load on the first chat question. Call this from
+    a startup thread (``RERANKER_WARMUP=1`` in ``app.main``) so that cost
+    lands at boot instead of on a user. Returns the resolved model name.
+    """
+    resolved = resolve_model_name(model_name)
+    _CrossEncoderSingleton.get(
+        model_name=resolved,
+        device=device,
+        max_length=max_length,
+    )
+    return resolved
+
+
+def is_loaded() -> bool:
+    """True once the singleton holds a model (used by health reporting)."""
+    return _CrossEncoderSingleton._instance is not None
+
+
 def rerank(
     query: str,
     candidates: Iterable[RerankCandidate],
@@ -131,7 +163,7 @@ def rerank(
     if top_k <= 0:
         raise ValueError("top_k must be positive")
 
-    resolved_model = model_name or os.getenv("RERANKER_MODEL", DEFAULT_RERANKER_MODEL)
+    resolved_model = resolve_model_name(model_name)
     encoder = _CrossEncoderSingleton.get(
         model_name=resolved_model,
         device=device,
@@ -159,5 +191,8 @@ __all__ = [
     "RerankCandidate",
     "RerankedHit",
     "rerank",
+    "preload",
+    "is_loaded",
+    "resolve_model_name",
     "DEFAULT_RERANKER_MODEL",
 ]

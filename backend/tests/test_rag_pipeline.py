@@ -36,7 +36,7 @@ def fake_hybrid(monkeypatch):
     def install(chunks):
         mod = types.ModuleType("app.rag.retriever")
 
-        def hybrid_search(workspace_id, query, top_k):  # noqa: ARG001
+        def hybrid_search(workspace_id, query, top_k, doc_id=None):  # noqa: ARG001
             return chunks[:top_k]
 
         mod.hybrid_search = hybrid_search  # type: ignore[attr-defined]
@@ -136,6 +136,73 @@ async def test_context_truncation_drops_tail_chunks(fake_hybrid, fake_llm, monke
     cits = frames[0]["citations"]
     # 5000 chars + header -> at most 1 fits in 6000 cap
     assert len(cits) <= 2
+
+
+@pytest.mark.asyncio
+async def test_citation_filename_resolved_from_postgres(fake_hybrid, fake_llm, monkeypatch):
+    """Chunks carry only doc_id; the citation must show the uploaded filename."""
+    doc_uuid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    fake_hybrid([
+        {"doc_id": doc_uuid, "chunk_id": "c1", "chunk_text": "ctx", "page_num": 4, "score": 0.5},
+    ])
+    fake_llm(["ok"])
+    seen: dict = {}
+
+    def fake_lookup(doc_ids):
+        seen["ids"] = list(doc_ids)
+        return {doc_uuid: "Q3-report.pdf"}
+
+    monkeypatch.setattr(pipeline, "_lookup_filenames", fake_lookup)
+
+    frames = _parse(await _collect(pipeline.answer_stream("ws1", "q?")))
+    assert seen["ids"] == [doc_uuid]
+    assert frames[0]["citations"][0]["filename"] == "Q3-report.pdf"
+
+
+@pytest.mark.asyncio
+async def test_citation_filename_lookup_failure_degrades_to_document(fake_hybrid, fake_llm, monkeypatch):
+    doc_uuid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    fake_hybrid([
+        {"doc_id": doc_uuid, "chunk_id": "c1", "chunk_text": "ctx", "page_num": 1, "score": 0.5},
+    ])
+    fake_llm(["ok"])
+
+    def boom(doc_ids):
+        raise RuntimeError("postgres down")
+
+    monkeypatch.setattr(pipeline, "_lookup_filenames", boom)
+
+    frames = _parse(await _collect(pipeline.answer_stream("ws1", "q?")))
+    assert frames[0]["citations"][0]["filename"] == "document"
+    assert frames[-1]["type"] == "done"
+
+
+def test_lookup_filenames_skips_non_uuid_ids_without_touching_postgres(monkeypatch):
+    """Legacy / test doc ids like "d1" must short-circuit before SessionLocal."""
+    import app.db.postgres as pg
+
+    def must_not_be_called():
+        raise AssertionError("SessionLocal must not be touched for non-UUID ids")
+
+    monkeypatch.setattr(pg, "SessionLocal", must_not_be_called)
+    assert pipeline._lookup_filenames(["d1", "", "not-a-uuid"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_doc_id_is_forwarded_to_retriever(fake_llm, monkeypatch):
+    seen: dict = {}
+    mod = types.ModuleType("app.rag.retriever")
+
+    def hybrid_search(workspace_id, query, top_k, doc_id=None):  # noqa: ARG001
+        seen["doc_id"] = doc_id
+        return []
+
+    mod.hybrid_search = hybrid_search  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.rag.retriever", mod)
+    fake_llm(["ok"])
+
+    await _collect(pipeline.answer_stream("ws1", "q?", doc_id="doc-42"))
+    assert seen["doc_id"] == "doc-42"
 
 
 @pytest.mark.asyncio

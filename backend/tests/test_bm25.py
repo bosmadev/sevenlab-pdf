@@ -80,6 +80,29 @@ def test_pipeline_accepts_custom_index_name():
     assert p[0]["$search"]["index"] == "alt_bm25"
 
 
+def test_pipeline_adds_doc_filter_when_scoped():
+    p = build_bm25_pipeline("ws-1", "query", doc_id="doc-A")
+    filt = p[0]["$search"]["compound"]["filter"]
+    assert filt == [
+        {"equals": {"path": "workspace_id", "value": "ws-1"}},
+        {"equals": {"path": "doc_id", "value": "doc-A"}},
+    ]
+
+
+def test_pipeline_omits_doc_filter_when_unscoped():
+    p = build_bm25_pipeline("ws-1", "query", doc_id=None)
+    filt = p[0]["$search"]["compound"]["filter"]
+    assert len(filt) == 1
+    assert filt[0]["equals"]["path"] == "workspace_id"
+
+
+def test_bm25_search_forwards_doc_id_to_pipeline(monkeypatch):
+    fake = _install_fake(monkeypatch, [])
+    bm25_search("ws-1", "revenue", top_k=5, doc_id="doc-Z")
+    filt = fake.last_pipeline[0]["$search"]["compound"]["filter"]
+    assert {"equals": {"path": "doc_id", "value": "doc-Z"}} in filt
+
+
 # ---------- bm25_search decoding --------------------------------------------
 
 

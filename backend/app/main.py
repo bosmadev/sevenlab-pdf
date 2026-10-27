@@ -10,11 +10,16 @@ Startup lifespan (T-003):
       place. Production deploys should leave this unset and run
       `python -m scripts.init_postgres` as an explicit step so DDL is not
       wedged into process startup.
+    - When `RERANKER_WARMUP=1`, load the BGE cross-encoder
+      (`BAAI/bge-reranker-v2-m3`, ~2.3 GB) in a background thread at boot.
+      Without it the first chat question pays the full download + load,
+      which on a fresh box is minutes, not seconds. Set it in production.
 """
 from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -41,8 +46,23 @@ log = logging.getLogger("sevenlab.main")
 settings = get_settings()
 
 
+def _warm_reranker() -> None:
+    """Background-thread body: load the cross-encoder once, log the outcome."""
+    try:
+        from app.rag.reranker import preload
+
+        name = preload()
+        log.info("reranker warm: %s loaded", name)
+    except Exception as exc:  # noqa: BLE001 — a cold reranker is slow, not fatal
+        log.warning("reranker warmup failed, first query will load lazily: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.environ.get("RERANKER_WARMUP") == "1":
+        threading.Thread(target=_warm_reranker, name="reranker-warmup", daemon=True).start()
+        log.info("reranker warmup started in background (RERANKER_WARMUP=1)")
+
     if os.environ.get("AUTO_INIT_SCHEMA") == "1":
         try:
             from app.db.postgres import init_schema

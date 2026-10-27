@@ -71,7 +71,7 @@ async def test_hybrid_pipeline_happy_path():
             _mk_vec_hit("c2", "d1", "chlorophyll fluorescence", 5),
         ]
 
-    def fake_bm25(workspace, query, top_k):
+    def fake_bm25(workspace, query, top_k, doc_id=None):
         return [
             _mk_bm25_hit("c2", "d1", "chlorophyll fluorescence", 5),
             _mk_bm25_hit("c3", "d1", "osmosis across semi-permeable membranes", 7),
@@ -92,6 +92,7 @@ async def test_hybrid_pipeline_happy_path():
     assert set(c2.sources) == {"vector", "bm25"}
     # Score plumbing: c2 carries both vector and bm25 scores forward
     assert c2.vector_score == pytest.approx(0.9)
+    assert c2.bm25_score == pytest.approx(7.3)
     # Both writers now agree on doc_id (post task #27 alignment);
     # retriever must round-trip it unchanged.
     assert all(h.doc_id == "d1" for h in out)
@@ -108,7 +109,7 @@ async def test_hybrid_search_module_returns_dicts_for_t012():
     def fake_vector(workspace, qvec, top_k, doc_id):
         return [_mk_vec_hit("c1", "d1", "example chunk text", 2)]
 
-    def fake_bm25(workspace, query, top_k):
+    def fake_bm25(workspace, query, top_k, doc_id=None):
         return []
 
     original = retriever._DEFAULT_RETRIEVER
@@ -140,7 +141,7 @@ async def test_pipeline_degrades_when_bm25_fails():
     def fake_vector(workspace, qvec, top_k, doc_id):
         return [_mk_vec_hit("c1", "d1", "vector-only answer", 1)]
 
-    def fake_bm25(workspace, query, top_k):
+    def fake_bm25(workspace, query, top_k, doc_id=None):
         raise RuntimeError("bm25_index missing")
 
     r = HybridRetriever(
@@ -162,7 +163,7 @@ async def test_pipeline_degrades_when_vector_fails():
     def fake_vector(workspace, qvec, top_k, doc_id):
         raise RuntimeError("mongo down")
 
-    def fake_bm25(workspace, query, top_k):
+    def fake_bm25(workspace, query, top_k, doc_id=None):
         return [_mk_bm25_hit("c9", "d9", "sparse-only answer", 3)]
 
     r = HybridRetriever(
@@ -196,12 +197,16 @@ async def test_document_filter_restricts_bm25_payloads():
     async def fake_embed(text, *, dimension=None):
         return [0.1] * 2048
 
+    seen_bm25_doc: dict[str, Any] = {}
+
     def fake_vector(workspace, qvec, top_k, doc_id):
         # Vector respects doc_id directly.
         return [_mk_vec_hit("c1", "d1", "doc-1 chunk", 2)] if doc_id == "d1" else []
 
-    def fake_bm25(workspace, query, top_k):
-        # BM25 helper lacks a doc filter today — returns everything.
+    def fake_bm25(workspace, query, top_k, doc_id=None):
+        # Simulate a BM25 backend that IGNORES the filter — the retriever's
+        # post-filter must still drop the sibling document's chunk.
+        seen_bm25_doc["doc_id"] = doc_id
         return [
             _mk_bm25_hit("c2", "d1", "doc-1 keyword hit", 3),
             _mk_bm25_hit("c9", "d9", "doc-9 keyword hit, must be dropped", 1),
@@ -216,6 +221,8 @@ async def test_document_filter_restricts_bm25_payloads():
     out = await r.search("ws1", "doc specific query", doc_id="d1")
     ids = {h.chunk_id for h in out}
     assert ids == {"c1", "c2"}, f"doc filter failed: {ids}"
+    # The filter is forwarded server-side too, not only applied after the fact.
+    assert seen_bm25_doc["doc_id"] == "d1"
 
 
 @pytest.mark.asyncio
@@ -250,7 +257,7 @@ async def test_top_k_override_respected():
     def fake_vector(workspace, qvec, top_k, doc_id):
         return [_mk_vec_hit(f"c{i}", "d1", f"chunk {i}" * (10 - i), i) for i in range(10)]
 
-    def fake_bm25(workspace, query, top_k):
+    def fake_bm25(workspace, query, top_k, doc_id=None):
         return []
 
     r = HybridRetriever(

@@ -7,17 +7,15 @@ Why Atlas native `$search` (T-009 design note):
     model file is ever shipped or loaded. Scoring, tokenisation, and
     stopword filtering live in the Atlas index definition.
 
-Expected search index (create via scripts/create_indexes.py, name=bm25_index):
+Expected search index — defined once in `app.db.indices.ensure_search_index`
+(create via `python -m scripts.create_search_indexes`, name=bm25_index):
     {
       "mappings": {
         "dynamic": false,
         "fields": {
-          "chunk_text": {
-            "type": "string",
-            "analyzer": "lucene.standard",
-            "searchAnalyzer": "lucene.standard"
-          },
-          "workspace_id": { "type": "token" }
+          "chunk_text":   { "type": "string", "analyzer": "lucene.standard" },
+          "workspace_id": { "type": "token" },
+          "doc_id":       { "type": "token" }
         }
       }
     }
@@ -90,21 +88,30 @@ def build_bm25_pipeline(
     query: str,
     top_k: int = DEFAULT_TOP_K,
     index_name: str = BM25_INDEX_NAME,
+    *,
+    doc_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the aggregation pipeline for a workspace-scoped BM25 search.
 
     The `compound` stage pairs a text match on `chunk_text` with a
-    `filter` on `workspace_id`. A filter clause contributes zero score,
-    so BM25 ranking is driven purely by the text match while isolation
-    stays strict. `limit` runs inside the `$search` stage so Lucene can
-    short-circuit; a trailing `$limit` guards against stray pipeline
-    extensions.
+    `filter` on `workspace_id` (and on `doc_id` when the caller scopes
+    the search to one PDF). A filter clause contributes zero score, so
+    BM25 ranking is driven purely by the text match while isolation stays
+    strict. Filtering server-side matters for per-document chat: a
+    workspace-wide top-20 followed by a client-side doc filter can return
+    zero hits for a document that has plenty of keyword matches.
     """
 
     if not workspace_id:
         raise ValueError("workspace_id must be a non-empty string")
     q = _coerce_query(query)
     k = _coerce_top_k(top_k)
+
+    filters: list[dict[str, Any]] = [
+        {"equals": {"path": "workspace_id", "value": workspace_id}}
+    ]
+    if doc_id:
+        filters.append({"equals": {"path": "doc_id", "value": doc_id}})
 
     return [
         {
@@ -119,14 +126,7 @@ def build_bm25_pipeline(
                             }
                         }
                     ],
-                    "filter": [
-                        {
-                            "equals": {
-                                "path": "workspace_id",
-                                "value": workspace_id,
-                            }
-                        }
-                    ],
+                    "filter": filters,
                 },
                 "scoreDetails": False,
             }
@@ -151,15 +151,19 @@ def bm25_search(
     top_k: int = DEFAULT_TOP_K,
     *,
     index_name: str = BM25_INDEX_NAME,
+    doc_id: str | None = None,
 ) -> list[BM25Hit]:
     """Run BM25 search on the `pdfs` collection and return ranked chunks.
 
     Returned list is ordered by descending BM25 score, length ≤ top_k.
+    ``doc_id`` narrows the search to one PDF inside the workspace.
     Raises `pymongo.errors.OperationFailure` if the `$search` stage is
     rejected — typically because `bm25_index` does not exist yet.
     """
 
-    pipeline = build_bm25_pipeline(workspace_id, query, top_k, index_name)
+    pipeline = build_bm25_pipeline(
+        workspace_id, query, top_k, index_name, doc_id=doc_id
+    )
     coll = get_pdfs_collection()
     cursor = coll.aggregate(pipeline)
     hits: list[BM25Hit] = []
