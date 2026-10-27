@@ -25,16 +25,11 @@ from app.services import document_service
 
 @pytest.fixture()
 def db_session() -> Session:
-    """Session bound to an in-memory SQLite with a UUID -> String shim."""
-    # Postgres UUID column type does not exist on SQLite — swap in CHAR(36).
-    from sqlalchemy import String
-    from sqlalchemy.dialects.postgresql import UUID as PgUUID
+    """Session bound to an in-memory SQLite.
 
-    for mapper in (User.__table__, Document.__table__, SessionToken.__table__, AuditLog.__table__):
-        for col in mapper.columns:
-            if isinstance(col.type, PgUUID):
-                col.type = String(36)
-
+    UUID columns use `app.db.types.UUIDType`, which transparently renders
+    as CHAR(36) on SQLite, so no column-type patching is needed.
+    """
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)

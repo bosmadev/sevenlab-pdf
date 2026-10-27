@@ -1,7 +1,7 @@
 """PDF text + table extraction — PyMuPDF for text, pdfplumber for tables.
 
-Decision 2026-10-27: hybrid approach. PyMuPDF (fitz) wins on text speed
-and font handling; pdfplumber wins on table structure recovery.
+Decision 2026-10-27: hybrid approach. PyMuPDF wins on text speed and
+font handling; pdfplumber wins on table structure recovery.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Final
 
-import fitz  # PyMuPDF
+import pymupdf  # PyMuPDF — upstream renamed from `fitz` (deprecated)
 import pdfplumber
 
 MAX_PAGES: Final[int] = int(os.getenv("MAX_PDF_PAGES", "500"))
@@ -44,7 +44,7 @@ class ExtractionResult:
 def _extract_text_pymupdf(pdf_bytes: bytes) -> tuple[list[PageText], int, bool]:
     pages: list[PageText] = []
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     except Exception as exc:  # noqa: BLE001
         raise PdfExtractionError(f"PyMuPDF open failed: {exc}") from exc
 

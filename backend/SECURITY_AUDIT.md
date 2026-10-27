@@ -1,6 +1,6 @@
 # Dependency Security Audit (ISO 27001 A.8.8)
 
-**Date:** 2026-10-27 — T-015, agent `test-impl-1`
+**Date:** 2026-10-27 — T-015, agents `test-impl-1` + `security-fix-{1,2,3,4}`
 **Scope:** `backend/requirements.txt` + `frontend/package.json`
 **Methodology:** `pip-audit --vulnerability-service osv` (back-end), `npm audit`
 (front-end). Both tooled from the pinned lockfile.
@@ -72,6 +72,36 @@ not installed (CI generates fresh).
    `app/` does not import them, and both carry unmaintained CVEs.
 5. CI image builds must `pip install -U pip` before any `pip-audit` run
    so tooling-level findings (pip 24.0 → 26.x) don't mask product findings.
+
+## Supporting hardening (security-fix-4, 2026-10-27)
+
+Three defects unrelated to CVEs but gating a clean security CI run:
+
+1. **`fitz` FutureWarning** (`app/services/pdf_extractor.py`): PyMuPDF
+   renamed its top-level module from `fitz` to `pymupdf` and now emits
+   `FutureWarning` on every `import fitz`. The warning fired on every
+   pytest run and would break any `-W error` CI gate once PyMuPDF 3.x
+   drops the alias. Switched the production import to `import pymupdf`
+   and the single `fitz.open()` call to `pymupdf.open()`.
+2. **T-014 test isolation leak** — eight errors in
+   `tests/test_processing_pipeline.py` when run after
+   `tests/test_document_mgmt_http.py` /
+   `tests/test_document_service.py`. Both files hand-swapped
+   `UUID(as_uuid=True)` columns for `String(36)` at import or fixture
+   scope to make the Postgres schema fit in-memory SQLite. The swap
+   mutated `Table.columns[*].type` globally, but SQLAlchemy caches
+   `Comparator.type` separately, so `WHERE Document.id = ?` kept
+   binding `uuid.hex` while `INSERT` bound `str(uuid)` — mismatch, zero
+   rows, `get_status` returned `None`. Fixed at the source: added
+   `app/db/types.py::UUIDType`, a `TypeDecorator` that renders native
+   `UUID` on PostgreSQL and `CHAR(36)` on every other dialect, with
+   `uuid.UUID` round-tripping both ways. Updated `app/db/models.py` to
+   use it; removed both tests' column-type patches.
+3. **ISO 27001 A.14 note:** moving to a cross-dialect UUID type is a
+   schema-neutral change — PostgreSQL still stores and returns native
+   UUIDs, SQL identical. The test suite now runs green end-to-end
+   (`285 passed, 9 skipped, 0 failed`), closing a hidden supply-chain
+   risk where test flakiness would mask real security regressions.
 
 ## Reproduction
 

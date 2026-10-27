@@ -15,25 +15,18 @@ import pytest
 from bson import ObjectId
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import String, create_engine
-from sqlalchemy.dialects.postgresql import UUID as PgUUID
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.db.models import AuditLog, Document, SessionToken, User
+from app.db.models import AuditLog, Document, SessionToken, User  # noqa: F401 — register with Base
 from app.db.postgres import Base, get_db
 from app.routes.document_mgmt import router as mgmt_router
 from app.security.deps import Owner, require_owner
 from app.services import chat_history
 
-
-# ---------------------------------------------------------------------------
-# One-time: swap Postgres UUID columns for String so SQLite can host them
-# ---------------------------------------------------------------------------
-for table in (User.__table__, Document.__table__, SessionToken.__table__, AuditLog.__table__):
-    for col in table.columns:
-        if isinstance(col.type, PgUUID):
-            col.type = String(36)
+# UUID columns are backed by `app.db.types.UUIDType`, which renders as
+# native UUID on Postgres and CHAR(36) on SQLite. No column-swap needed.
 
 
 class _FakeCursor:
