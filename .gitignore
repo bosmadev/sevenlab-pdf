@@ -67,6 +67,7 @@ uploads/
 /tmp/uploads/
 
 # === Project artifacts ===
+backend/sandbox/
 *.pdf.bak
 *.sqlite
 *.db
