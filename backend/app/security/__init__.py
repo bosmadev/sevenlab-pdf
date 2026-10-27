@@ -21,6 +21,7 @@ from app.security.rate_limit import (
     reset_login_rate_limit,
 )
 from app.security.deps import Owner, require_owner, require_admin, optional_owner
+from app.security.session_store import resolve_session
 
 __all__ = [
     "ADMIN_OWNER_ID",
@@ -40,5 +41,6 @@ __all__ = [
     "require_owner",
     "reset_login_rate_limit",
     "resolve_owner_id",
+    "resolve_session",
     "verify_session_token",
 ]

@@ -17,7 +17,9 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.security import (
@@ -28,7 +30,13 @@ from app.security import (
     record_login_success,
     resolve_owner_id,
 )
-from app.security.tokens import parse_session_token, session_max_age
+from app.security.session_store import (
+    SessionStoreError,
+    record_session,
+    resolve_session,
+    revoke_session,
+)
+from app.security.tokens import session_max_age
 from app.services.audit import audit_login, extract_client_ip
 
 log = logging.getLogger(__name__)
@@ -93,12 +101,36 @@ async def login(body: LoginBody, request: Request, response: Response) -> dict:
         )
 
     record_login_success(rate.client_key)
+    token = create_session_token(owner_id)
+
+    # Register the token server-side so logout can revoke it. If the row
+    # cannot be written the token is never handed out: an unrecorded token
+    # would be unrevocable for its whole 7-day lifetime.
+    try:
+        await run_in_threadpool(
+            record_session,
+            token,
+            client_ip=client_ip,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except SessionStoreError as exc:
+        log.error("session store unavailable - refusing login: %s", exc)
+        audit_login(
+            workspace_id=owner_id,
+            client_ip=client_ip,
+            success=False,
+            reason="session_store_unavailable",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session store unavailable",
+        )
+
     audit_login(
         workspace_id=owner_id,
         client_ip=client_ip,
         success=True,
     )
-    token = create_session_token(owner_id)
 
     # Cookie Max-Age and the signed issued-at inside the token share one
     # lifetime, so browser expiry and server expiry happen together.

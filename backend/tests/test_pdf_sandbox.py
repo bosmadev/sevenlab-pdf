@@ -221,3 +221,44 @@ def test_inline_mode_round_trips_a_minimal_pdf(monkeypatch: pytest.MonkeyPatch) 
     assert result.mode == "inline"
     assert result.pages == 1
     assert result.sanitized_pdf.startswith(b"%PDF-")
+
+
+# ------------------------------------------------ extraction reconstruction
+
+
+def test_to_extraction_result_rebuilds_extractor_dataclasses() -> None:
+    """The pipeline consumes ExtractionResult, so the worker JSON must round-trip."""
+    from app.services.pdf_extractor import ExtractionResult, PageTable, PageText
+
+    payload = _ok_payload()
+    payload["extraction"]["pages"].append(
+        {"page_num": 2, "text": "world", "bbox_image_regions": [[0.0, 1.0, 2.0, 3.0]]}
+    )
+    payload["extraction"]["tables"] = [{"page_num": 2, "rows": [["a", "b"], ["c", "d"]]}]
+
+    result = sb.SandboxResult(
+        sanitized_pdf=b"%PDF-",
+        sanitizer=payload["sanitizer"],
+        extraction=payload["extraction"],
+    )
+    extraction = result.to_extraction_result()
+
+    assert isinstance(extraction, ExtractionResult)
+    assert extraction.page_count == 2
+    assert extraction.truncated is False
+    assert [p.page_num for p in extraction.pages] == [1, 2]
+    assert all(isinstance(p, PageText) for p in extraction.pages)
+    assert extraction.pages[0].text == "hello"
+    assert extraction.pages[1].bbox_image_regions == [(0.0, 1.0, 2.0, 3.0)]
+    assert isinstance(extraction.tables[0], PageTable)
+    assert extraction.tables[0].page_num == 2
+    assert extraction.tables[0].rows == [["a", "b"], ["c", "d"]]
+
+
+def test_to_extraction_result_tolerates_empty_payload() -> None:
+    result = sb.SandboxResult(sanitized_pdf=b"%PDF-", sanitizer={}, extraction={})
+    extraction = result.to_extraction_result()
+    assert extraction.pages == []
+    assert extraction.tables == []
+    assert extraction.page_count == 0
+    assert extraction.truncated is False

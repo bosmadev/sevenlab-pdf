@@ -9,6 +9,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { type FormEvent, Suspense, useState } from "react";
+import { errorMessageFromBody } from "@/lib/api";
 import { APP_DESCRIPTION, APP_NAME, APP_VERSION } from "@/lib/app-config";
 import styles from "./login.module.css";
 
@@ -79,17 +80,18 @@ function LoginForm() {
         const retryAfter = res.headers.get("retry-after") || "60";
         setError(`Too many attempts. Try again in ${retryAfter}s.`);
       } else {
-        let message = "Invalid password";
+        // The backend answers with the errors.py envelope; a 422 carries a
+        // list in `detail`, which must never reach the DOM as an object.
+        let body: unknown = null;
         try {
-          const data = (await res.json()) as { detail?: string; error?: string };
-          message = data.detail || data.error || message;
+          body = await res.json();
         } catch {
-          /* non-JSON response — fall back to default */
+          /* non-JSON response (proxy / aborted) — status fallback below */
         }
-        setError(message);
+        setError(errorMessageFromBody(res.status, body));
       }
     } catch {
-      setError("Connection failed");
+      setError("Connection failed. Check that the backend is running.");
     } finally {
       setLoading(false);
     }

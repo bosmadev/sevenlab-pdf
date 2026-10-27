@@ -31,6 +31,7 @@ export interface ChatMessage {
   citations?: Citation[];
   createdAt: number;
   streaming?: boolean;
+  cancelled?: boolean;
   error?: string;
 }
 

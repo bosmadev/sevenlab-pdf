@@ -7,10 +7,9 @@
 ## The main /etc/caddy/Caddyfile must `import conf.d/*.caddy` for this to load.
 
 sevenlab.bosma.dev {
-    # TLS via Cloudflare DNS-01 (bosmadev wildcard pattern).
-    tls {
-        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-    }
+    # TLS: automatic HTTP-01 via Let's Encrypt, same as every other vhost in
+    # /etc/caddy/Caddyfile. The Debian caddy package ships no cloudflare DNS
+    # module, so a `tls { dns cloudflare }` block fails `caddy validate`.
 
     # SSE streams must not be buffered — the Next.js frontend proxies
     # /api/chat/ask/stream straight through, but Caddy would still buffer
@@ -19,6 +18,11 @@ sevenlab.bosma.dev {
     @sse path /api/chat/ask/stream
     reverse_proxy @sse 127.0.0.1:8001 {
         flush_interval -1
+        # Same proxy headers as @api. header_up OVERWRITES X-Forwarded-For
+        # (Caddy's default appends), so a client-supplied header can never be
+        # the left-most entry the audit log and login limiter key on.
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote_host}
         transport http {
             response_header_timeout 300s
         }

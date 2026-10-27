@@ -16,6 +16,41 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db.models import AuditLog, Document, SessionToken, User
 from app.db.postgres import Base
 from app.services import document_service
+from app.services.gridfs_storage import PdfNotFoundError
+
+
+# ---------------------------------------------------------------------------
+# Mongo + GridFS purge stubs — soft delete calls both; no live Atlas here
+# ---------------------------------------------------------------------------
+
+
+class _PurgeRecorder:
+    """Records the purge calls soft delete makes; flags flip them to failures."""
+
+    def __init__(self) -> None:
+        self.chunk_calls: list[tuple[str, str]] = []
+        self.pdf_calls: list[tuple[str, str]] = []
+        self.chunks_error: Exception | None = None
+        self.pdf_error: Exception | None = None
+
+    def delete_document_chunks(self, workspace_id: str, doc_id: str) -> int:
+        self.chunk_calls.append((workspace_id, doc_id))
+        if self.chunks_error is not None:
+            raise self.chunks_error
+        return 5
+
+    def delete_pdf(self, file_id: str, *, workspace_id: str) -> None:
+        self.pdf_calls.append((file_id, workspace_id))
+        if self.pdf_error is not None:
+            raise self.pdf_error
+
+
+@pytest.fixture(autouse=True)
+def purge(monkeypatch: pytest.MonkeyPatch) -> _PurgeRecorder:
+    rec = _PurgeRecorder()
+    monkeypatch.setattr("app.db.vector.delete_document_chunks", rec.delete_document_chunks)
+    monkeypatch.setattr("app.services.gridfs_storage.delete_pdf", rec.delete_pdf)
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -223,3 +258,91 @@ def test_soft_delete_preserves_underlying_data(db_session: Session) -> None:
     )
     assert reread.gridfs_file_id == original_gridfs
     assert reread.sha256 == original_sha
+
+
+# ---------------------------------------------------------------------------
+# soft_delete_document — derived-data purge (Mongo chunks + GridFS bytes)
+# ---------------------------------------------------------------------------
+
+
+def test_soft_delete_purges_chunks_and_gridfs(
+    db_session: Session, purge: _PurgeRecorder
+) -> None:
+    alice = _mk_user(db_session, "alice")
+    doc = _mk_doc(db_session, alice)
+
+    result = document_service.soft_delete_document(
+        db_session, document_id=doc.id, workspace_id="alice"
+    )
+
+    assert purge.chunk_calls == [("alice", str(doc.id))]
+    assert purge.pdf_calls == [(doc.gridfs_file_id, "alice")]
+    assert result.chunk_count == 0
+    assert result.deleted_at is not None
+
+
+def test_soft_delete_purges_only_once(
+    db_session: Session, purge: _PurgeRecorder
+) -> None:
+    alice = _mk_user(db_session, "alice")
+    doc = _mk_doc(db_session, alice)
+
+    document_service.soft_delete_document(
+        db_session, document_id=doc.id, workspace_id="alice"
+    )
+    document_service.soft_delete_document(
+        db_session, document_id=doc.id, workspace_id="alice"
+    )
+
+    assert len(purge.chunk_calls) == 1
+    assert len(purge.pdf_calls) == 1
+
+
+def test_soft_delete_survives_mongo_outage(
+    db_session: Session, purge: _PurgeRecorder
+) -> None:
+    """A failed chunk purge must not roll back the delete the user saw."""
+    alice = _mk_user(db_session, "alice")
+    doc = _mk_doc(db_session, alice)
+    purge.chunks_error = RuntimeError("mongo down")
+
+    result = document_service.soft_delete_document(
+        db_session, document_id=doc.id, workspace_id="alice"
+    )
+
+    assert result.deleted_at is not None
+    assert result.status == "deleted"
+    # chunk_count is only zeroed once the purge is confirmed
+    assert result.chunk_count == 5
+    # the GridFS purge still runs — the two steps are independent
+    assert purge.pdf_calls == [(doc.gridfs_file_id, "alice")]
+
+
+def test_soft_delete_tolerates_missing_gridfs_file(
+    db_session: Session, purge: _PurgeRecorder
+) -> None:
+    alice = _mk_user(db_session, "alice")
+    doc = _mk_doc(db_session, alice)
+    purge.pdf_error = PdfNotFoundError("pdf not found")
+
+    result = document_service.soft_delete_document(
+        db_session, document_id=doc.id, workspace_id="alice"
+    )
+
+    assert result.deleted_at is not None
+    assert result.chunk_count == 0
+
+
+def test_soft_delete_survives_gridfs_outage(
+    db_session: Session, purge: _PurgeRecorder
+) -> None:
+    alice = _mk_user(db_session, "alice")
+    doc = _mk_doc(db_session, alice)
+    purge.pdf_error = RuntimeError("gridfs down")
+
+    result = document_service.soft_delete_document(
+        db_session, document_id=doc.id, workspace_id="alice"
+    )
+
+    assert result.deleted_at is not None
+    assert result.chunk_count == 0

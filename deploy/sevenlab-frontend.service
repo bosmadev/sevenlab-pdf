@@ -18,9 +18,10 @@ Environment=NODE_ENV=production
 Environment=HOSTNAME=127.0.0.1
 Environment=PORT=3006
 
-# `npm start` runs `next start` which serves the prebuilt .next output.
-# The install.sh script runs `npm run build` once per deploy.
-ExecStart=/usr/bin/npm start
+# Serve the prebuilt .next output (install.sh runs `npm run build` per deploy).
+# Call `next` directly: package.json's `start` script pins `--port 3000`, and a
+# CLI flag beats the PORT= env above, so `npm start` would bind the wrong port.
+ExecStart=/usr/bin/node /opt/sevenlab/frontend/node_modules/next/dist/bin/next start --port 3006 --hostname 127.0.0.1
 
 Restart=on-failure
 RestartSec=5s

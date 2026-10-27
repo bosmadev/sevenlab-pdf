@@ -274,3 +274,83 @@ def test_is_retryable_detects_rate_limit():
     assert pipeline._is_retryable(RuntimeError("HTTP 429 Too Many Requests"))
     assert pipeline._is_retryable(RuntimeError("timeout waiting for upstream"))
     assert not pipeline._is_retryable(RuntimeError("KeyError 'foo'"))
+
+
+# ---------------------------------------------------------------------------
+# Parsing stage goes through the Docker sandbox (ISO 27001 A.8.7)
+# ---------------------------------------------------------------------------
+
+
+def _worker_payload() -> dict[str, Any]:
+    import base64
+
+    return {
+        "sanitizer": {
+            "original_sha256": "a" * 64,
+            "sanitized_sha256": "b" * 64,
+            "stripped_keys": [],
+            "pages": 1,
+            "was_encrypted": False,
+            "original_bytes": 5,
+            "sanitized_bytes": 5,
+        },
+        "sanitized_pdf_b64": base64.b64encode(b"%PDF-").decode("ascii"),
+        "extraction": {
+            "page_count": 1,
+            "truncated": False,
+            "pages": [{"page_num": 1, "text": "hello", "bbox_image_regions": []}],
+            "tables": [{"page_num": 1, "rows": [["k", "v"]]}],
+        },
+    }
+
+
+def test_extract_stage_routes_bytes_through_docker_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """In docker mode the parsing stage must spawn the worker, not PyMuPDF."""
+    import json
+    import subprocess
+
+    monkeypatch.setenv("PDF_SANDBOX_MODE", "docker")
+    argv_seen: list[list[str]] = []
+    stdin_seen: list[bytes] = []
+
+    def fake_run(argv, **kw):
+        argv_seen.append(list(argv))
+        stdin_seen.append(kw.get("input", b""))
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=json.dumps(_worker_payload()).encode(),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = pipeline._extract(b"%PDF-1.4 untrusted")
+
+    assert len(argv_seen) == 1
+    assert argv_seen[0][:2] == ["docker", "run"]
+    assert "--network=none" in argv_seen[0]
+    assert stdin_seen == [b"%PDF-1.4 untrusted"]
+    assert result.page_count == 1
+    assert [p.text for p in result.pages] == ["hello"]
+    assert result.tables[0].rows == [["k", "v"]]
+
+
+def test_extract_stage_wraps_sandbox_failure_as_parsing_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import subprocess
+
+    monkeypatch.setenv("PDF_SANDBOX_MODE", "docker")
+
+    def hang(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd=["docker"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    with pytest.raises(pipeline.PipelineStageError) as excinfo:
+        pipeline._extract(b"%PDF-1.4")
+    assert excinfo.value.stage == "parsing"
+    assert "timed out" in str(excinfo.value)

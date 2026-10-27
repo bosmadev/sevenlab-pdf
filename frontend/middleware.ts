@@ -5,13 +5,16 @@
  * is verified by the FastAPI backend on every API call. That split keeps
  * `SESSION_SECRET` out of the Next.js runtime.
  *
- * Open paths: /login, /api/auth (so the login POST can proceed), static
- * assets, and favicon.
+ * Open paths: /login, /api/* (FastAPI enforces auth there and answers a
+ * JSON 401 that `lib/session.redirectToLogin` turns into navigation; an
+ * HTML redirect would make XHR/fetch callers see a 200 login page instead),
+ * static assets, and favicon. In production Caddy routes /api/* straight
+ * to FastAPI, so this only matters for the local dev proxy.
  */
 import { NextResponse, type NextRequest } from "next/server";
 
 const COOKIE_NAME = "app_session";
-const OPEN_PATHS = ["/login", "/api/auth"];
+const OPEN_PATHS = ["/login", "/api"];
 
 function isOpen(pathname: string): boolean {
   if (OPEN_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {

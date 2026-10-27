@@ -156,7 +156,13 @@ export function uploadPdf({
     xhr.onload = () => {
       const body: unknown = xhr.response;
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve((body ?? {}) as UploadResponse);
+        // A 2xx without a document id means a proxy or redirect swallowed
+        // the real answer (e.g. an HTML login page); never report success.
+        if (body && typeof body === "object" && typeof (body as UploadResponse).id === "string") {
+          resolve(body as UploadResponse);
+        } else {
+          reject(new ApiError(xhr.status, body, "unexpected response from server"));
+        }
       } else if (xhr.status === 401) {
         redirectToLogin();
         reject(new UnauthorizedError());

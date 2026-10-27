@@ -268,3 +268,127 @@ async def test_top_k_override_respected():
     )
     out = await r.search("ws1", "q", top_k=3)
     assert len(out) == 3
+
+
+# ---------------------------------------------------------------------------
+# Soft-deleted document guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_documents_dropped_from_both_retrievers():
+    async def fake_embed(text, *, dimension=None):
+        return [0.1] * 2048
+
+    def fake_vector(workspace, qvec, top_k, doc_id):
+        return [
+            _mk_vec_hit("c1", "d1", "live document chunk", 1),
+            _mk_vec_hit("c9", "d9", "deleted document chunk, must vanish", 1),
+        ]
+
+    def fake_bm25(workspace, query, top_k, doc_id=None):
+        return [
+            _mk_bm25_hit("c2", "d1", "live keyword hit", 2),
+            _mk_bm25_hit("c8", "d9", "deleted keyword hit, must vanish too", 2),
+        ]
+
+    seen: dict[str, Any] = {}
+
+    def fake_deleted(workspace, doc_ids):
+        seen["workspace"] = workspace
+        seen["doc_ids"] = set(doc_ids)
+        return {"d9"}
+
+    r = HybridRetriever(
+        embed_query_fn=fake_embed,
+        vector_search_fn=fake_vector,
+        bm25_search_fn=fake_bm25,
+        rerank_fn=_fake_rerank(8),
+        deleted_doc_ids_fn=fake_deleted,
+    )
+    out = await r.search("ws1", "anything")
+    assert {h.chunk_id for h in out} == {"c1", "c2"}
+    # The lookup is one call carrying the union of both retrievers' doc ids.
+    assert seen == {"workspace": "ws1", "doc_ids": {"d1", "d9"}}
+
+
+@pytest.mark.asyncio
+async def test_all_hits_soft_deleted_returns_empty():
+    async def fake_embed(text, *, dimension=None):
+        return [0.1] * 2048
+
+    r = HybridRetriever(
+        embed_query_fn=fake_embed,
+        vector_search_fn=lambda *a, **kw: [_mk_vec_hit("c9", "d9", "gone", 1)],
+        bm25_search_fn=lambda *a, **kw: [_mk_bm25_hit("c8", "d9", "gone too", 1)],
+        rerank_fn=_fake_rerank(8),
+        deleted_doc_ids_fn=lambda ws, ids: {"d9"},
+    )
+    assert await r.search("ws1", "anything") == []
+
+
+@pytest.mark.asyncio
+async def test_deleted_guard_outage_fails_open():
+    async def fake_embed(text, *, dimension=None):
+        return [0.1] * 2048
+
+    def fake_deleted(workspace, doc_ids):
+        raise RuntimeError("postgres down")
+
+    r = HybridRetriever(
+        embed_query_fn=fake_embed,
+        vector_search_fn=lambda *a, **kw: [_mk_vec_hit("c1", "d1", "still served", 1)],
+        bm25_search_fn=lambda *a, **kw: [],
+        rerank_fn=_fake_rerank(8),
+        deleted_doc_ids_fn=fake_deleted,
+    )
+    out = await r.search("ws1", "anything")
+    assert [h.chunk_id for h in out] == ["c1"]
+
+
+def test_deleted_doc_ids_reads_postgres_deleted_at():
+    """The default guard queries ``documents.deleted_at`` — SQLite stands in."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db.models import Document, User
+    from app.db.postgres import Base
+    from app.rag.retriever import deleted_doc_ids
+
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, future=True)
+
+    live_id = uuid.uuid4()
+    gone_id = uuid.uuid4()
+    with SessionLocal() as db:
+        user = User(id=uuid.uuid4(), workspace_id="alice", password_hash="x")
+        db.add(user)
+        db.flush()
+        for did, deleted in ((live_id, False), (gone_id, True)):
+            db.add(
+                Document(
+                    id=did,
+                    user_id=user.id,
+                    workspace_id="alice",
+                    original_filename="paper.pdf",
+                    sanitized_filename="paper.pdf",
+                    gridfs_file_id="0" * 24,
+                    sha256="a" * 64,
+                    size_bytes=1,
+                    status="deleted" if deleted else "ready",
+                    deleted_at=datetime.now(timezone.utc) if deleted else None,
+                )
+            )
+        db.commit()
+
+    found = deleted_doc_ids(
+        "alice",
+        [str(live_id), str(gone_id), "not-a-uuid"],
+        session_factory=SessionLocal,
+    )
+    assert found == {str(gone_id)}
+    assert deleted_doc_ids("alice", [], session_factory=SessionLocal) == set()

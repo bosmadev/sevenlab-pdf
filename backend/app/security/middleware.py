@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from app.security.password import is_admin_owner
-from app.security.tokens import COOKIE_NAME, verify_session_token
+from app.security.session_store import resolve_session
+from app.security.tokens import COOKIE_NAME
 
 # Prefixes that require a verified session cookie.
 PROTECTED_PREFIXES: tuple[str, ...] = (
@@ -42,7 +44,10 @@ class WorkspaceAuthMiddleware(BaseHTTPMiddleware):
         # Always try to resolve the cookie so downstream code can rely on
         # ``request.state.workspace_id`` even on open routes.
         token = request.cookies.get(COOKIE_NAME)
-        owner_id = verify_session_token(token)
+        # HMAC + signed lifetime, then the ``sessions`` row (revocation).
+        # The row lookup is a sync DB call, so keep it off the event loop.
+        claims = await run_in_threadpool(resolve_session, token) if token else None
+        owner_id = claims.owner_id if claims else None
         if owner_id:
             request.state.owner_id = owner_id
             request.state.workspace_id = owner_id
@@ -53,8 +58,18 @@ class WorkspaceAuthMiddleware(BaseHTTPMiddleware):
             request.state.is_admin = False
 
         if _is_protected(path, self._protected) and not owner_id:
+            # Same envelope as app.errors so the frontend has one shape to
+            # parse; request_id is set by the outer RequestIdMiddleware.
+            rid = getattr(request.state, "request_id", None) or "unknown"
             return JSONResponse(
-                {"error": "Not authenticated"},
+                {
+                    "detail": "Not authenticated",
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Not authenticated. Please sign in again.",
+                        "request_id": rid,
+                    },
+                },
                 status_code=401,
             )
 

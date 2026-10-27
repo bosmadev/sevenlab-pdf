@@ -2,8 +2,12 @@
 # Must stay a strict subset of backend/requirements.txt — the sandbox has
 # no network, no DB, no Azure clients. Pin the same versions so what we
 # tested in the main venv matches what runs under isolation.
-pymupdf==1.25.1
-pdfplumber==0.11.4
+#
+# Synced with requirements.txt after T-015: pdfplumber 0.11.10 pulls
+# pdfminer-six>=20251230 (PYSEC-2026-1761/1762), which matters most HERE —
+# the sandbox is the process that parses untrusted uploads.
+pymupdf==2.0
+pdfplumber==0.11.10
 pikepdf==9.4.2
 pytesseract==0.3.13
-pillow==11.0.0
+pillow==13.0.0

@@ -60,7 +60,8 @@ Thumbs.db
 
 # === Logs / tmp / uploads ===
 *.log
-logs/
+logs/*
+!logs/.gitkeep
 tmp/
 .tmp/
 uploads/

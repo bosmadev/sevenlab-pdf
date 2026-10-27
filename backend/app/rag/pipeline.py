@@ -31,6 +31,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.rag.llm import LLMError, stream_chat
+from app.services import chat_history
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,54 @@ async def _attach_filenames(chunks: list[dict[str, Any]]) -> list[dict[str, Any]
     return chunks
 
 
+def _stored_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map live SSE citations onto the ``ChatCitation`` storage shape.
+
+    The SSE frame says ``page``; the stored row says ``page_num`` (T-013
+    contract, already round-tripped by ``GET /api/documents/{id}/chat``).
+    """
+    out: list[dict[str, Any]] = []
+    for c in citations:
+        out.append({
+            "n": c.get("n"),
+            "doc_id": c.get("doc_id"),
+            "chunk_id": c.get("chunk_id"),
+            "page_num": c.get("page"),
+            "filename": c.get("filename"),
+            "score": c.get("score"),
+            "preview": c.get("preview"),
+        })
+    return out
+
+
+def _persist_turn(
+    workspace_id: str,
+    doc_id: str,
+    question: str,
+    answer: str,
+    citations: list[dict[str, Any]],
+) -> None:
+    """Write the user question and assistant answer to the ``chats`` collection.
+
+    Runs on a worker thread (pymongo is sync). Only called for a completed
+    turn, so a failed LLM call never leaves an orphan question in history.
+    """
+    chat_history.append_message(
+        workspace_id=workspace_id,
+        document_id=doc_id,
+        role="user",
+        content=question,
+    )
+    if answer.strip():
+        chat_history.append_message(
+            workspace_id=workspace_id,
+            document_id=doc_id,
+            role="assistant",
+            content=answer,
+            citations=_stored_citations(citations),
+        )
+
+
 async def answer_stream(
     workspace_id: str,
     question: str,
@@ -183,8 +232,14 @@ async def answer_stream(
     try:
         chunks = await _retrieve(workspace_id, question, s.rag_top_k, doc_id=doc_id)
     except Exception as e:
-        logger.exception("rag: retrieval failed")
-        yield _sse({"type": "error", "message": f"retrieval failed: {e}"})
+        # Full detail goes to the log; the frame stays generic because the
+        # driver message can carry Atlas hostnames or query internals.
+        logger.exception("rag: retrieval failed: %s: %s", type(e).__name__, e)
+        yield _sse({
+            "type": "error",
+            "code": "RETRIEVAL_FAILED",
+            "message": "Search failed. Please try again in a moment.",
+        })
         return
 
     chunks = await _attach_filenames(chunks)
@@ -203,16 +258,40 @@ async def answer_stream(
     ]
 
     # 3. Stream LLM
+    answer_parts: list[str] = []
     try:
         async for token in stream_chat(messages):
+            answer_parts.append(token)
             yield _sse({"type": "token", "text": token})
     except LLMError as e:
         logger.warning("rag: LLM stream failed: %s", e)
-        yield _sse({"type": "error", "message": str(e)})
+        yield _sse({"type": "error", "code": "LLM_FAILED", "message": str(e)})
         return
     except Exception as e:
-        logger.exception("rag: unexpected LLM failure")
-        yield _sse({"type": "error", "message": f"llm error: {e}"})
+        logger.exception("rag: unexpected LLM failure: %s: %s", type(e).__name__, e)
+        yield _sse({
+            "type": "error",
+            "code": "LLM_FAILED",
+            "message": "The model did not answer. Please try again.",
+        })
         return
+
+    # 4. Persist the completed turn (per-document history only; a
+    #    workspace-wide question has no document row to hang it on).
+    #    Runs BEFORE the done frame so a client that closes on `done`
+    #    cannot cancel the generator mid-write. Best-effort: a Mongo
+    #    outage degrades reload persistence, never the answer itself.
+    if doc_id:
+        try:
+            await asyncio.to_thread(
+                _persist_turn,
+                workspace_id,
+                doc_id,
+                question,
+                "".join(answer_parts),
+                citations,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("rag: chat history persist failed for doc %s: %s", doc_id, e)
 
     yield _sse({"type": "done"})

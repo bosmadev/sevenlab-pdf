@@ -69,6 +69,58 @@ html, body {
 ::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 
+::selection {
+  background: rgba(148, 163, 184, 0.3);
+  color: #e2e8f0;
+}
+
+/* Terminal action buttons, mirroring ~/source/scraper .btn-* (dim fill, glow on hover) */
+@layer components {
+  .tui-btn {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    padding: 0.25rem 0.625rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-default);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    transition: all 0.15s;
+  }
+  .tui-btn:hover:not(:disabled) {
+    background: var(--bg-overlay);
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+  }
+  .tui-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .tui-btn-primary {
+    background: var(--accent-dim);
+    border-color: rgba(148, 163, 184, 0.35);
+    color: var(--accent);
+  }
+  .tui-btn-primary:hover:not(:disabled) {
+    background: rgba(148, 163, 184, 0.18);
+    border-color: var(--accent);
+    color: #cbd5e1;
+    box-shadow: 0 0 12px var(--accent-glow);
+  }
+  .tui-btn-danger {
+    background: rgba(248, 113, 113, 0.12);
+    border-color: rgba(248, 113, 113, 0.35);
+    color: var(--danger-color);
+  }
+  .tui-btn-danger:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.22);
+    border-color: var(--danger-color);
+    color: #fca5a5;
+    box-shadow: 0 0 12px rgba(248, 113, 113, 0.2);
+  }
+}
+
 /* Terminal-style blinking caret for assistant streaming */
 @keyframes tuiCaret {
   0%, 50% { opacity: 1; }

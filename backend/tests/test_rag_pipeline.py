@@ -189,7 +189,7 @@ def test_lookup_filenames_skips_non_uuid_ids_without_touching_postgres(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_doc_id_is_forwarded_to_retriever(fake_llm, monkeypatch):
+async def test_doc_id_is_forwarded_to_retriever(fake_llm, monkeypatch, captured_history):
     seen: dict = {}
     mod = types.ModuleType("app.rag.retriever")
 
@@ -217,3 +217,91 @@ async def test_llm_error_becomes_error_frame_not_exception(fake_hybrid, fake_llm
     assert frames[0]["type"] == "citations"
     assert frames[-1]["type"] == "error"
     assert "boom" in frames[-1]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Chat history persistence (T-013 wiring) — no Mongo, append_message is stubbed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_history(monkeypatch):
+    """Record every ``chat_history.append_message`` call the pipeline makes."""
+    calls: list[dict] = []
+
+    def _append(**kw):
+        calls.append(kw)
+        return {"id": str(len(calls)), **kw}
+
+    monkeypatch.setattr(pipeline.chat_history, "append_message", _append)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_completed_doc_turn_persists_question_and_answer(
+    fake_hybrid, fake_llm, captured_history
+):
+    fake_hybrid([
+        {"doc_id": "doc-42", "chunk_id": "c1", "chunk_text": "ctx", "page_num": 7,
+         "filename": "f.pdf", "score": 0.9},
+    ])
+    fake_llm(["The ", "answer [1]."])
+
+    frames = _parse(await _collect(pipeline.answer_stream("ws1", "q?", doc_id="doc-42")))
+    assert frames[-1]["type"] == "done"
+
+    assert [c["role"] for c in captured_history] == ["user", "assistant"]
+    user, asst = captured_history
+    assert user["workspace_id"] == asst["workspace_id"] == "ws1"
+    assert user["document_id"] == asst["document_id"] == "doc-42"
+    assert user["content"] == "q?"
+    assert asst["content"] == "The answer [1]."
+    cit = asst["citations"][0]
+    assert cit["n"] == 1
+    assert cit["page_num"] == 7  # SSE `page` is stored as T-013 `page_num`
+    assert cit["filename"] == "f.pdf"
+    assert cit["doc_id"] == "doc-42"
+
+
+@pytest.mark.asyncio
+async def test_persist_runs_before_done_frame(fake_hybrid, fake_llm, captured_history):
+    """A client that closes on `done` must not be able to cancel the write."""
+    fake_hybrid([])
+    fake_llm(["ok"])
+    seen_at_done: list[int] = []
+
+    async for frame in pipeline.answer_stream("ws1", "q?", doc_id="doc-42"):
+        if json.loads(frame[6:-2])["type"] == "done":
+            seen_at_done.append(len(captured_history))
+    assert seen_at_done == [2]
+
+
+@pytest.mark.asyncio
+async def test_workspace_wide_chat_is_not_persisted(fake_hybrid, fake_llm, captured_history):
+    fake_hybrid([])
+    fake_llm(["ok"])
+    await _collect(pipeline.answer_stream("ws1", "q?"))
+    assert captured_history == []
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_leaves_no_orphan_question(fake_hybrid, fake_llm, captured_history):
+    fake_hybrid([])
+    fake_llm([], raise_exc=pipeline.LLMError("boom"))
+    frames = _parse(await _collect(pipeline.answer_stream("ws1", "q?", doc_id="doc-42")))
+    assert frames[-1]["type"] == "error"
+    assert captured_history == []
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_still_streams_and_sends_done(fake_hybrid, fake_llm, monkeypatch):
+    fake_hybrid([])
+    fake_llm(["ok"])
+
+    def boom(**kw):  # noqa: ARG001
+        raise RuntimeError("mongo down")
+
+    monkeypatch.setattr(pipeline.chat_history, "append_message", boom)
+    frames = _parse(await _collect(pipeline.answer_stream("ws1", "q?", doc_id="doc-42")))
+    assert [f["text"] for f in frames if f["type"] == "token"] == ["ok"]
+    assert frames[-1]["type"] == "done"

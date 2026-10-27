@@ -8,6 +8,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { UnauthorizedError } from "@/lib/api";
 import { deleteDocument, listDocuments } from "@/lib/documents";
 import type { DocumentSummary } from "@/lib/types";
 
@@ -53,6 +54,8 @@ export function DocumentList({ activeId, onSelect, refreshToken = 0 }: Props) {
       setError(null);
     } catch (e) {
       if ((e as DOMException)?.name === "AbortError") return;
+      // 401: lib/session.redirectToLogin() already navigated to /login.
+      if (e instanceof UnauthorizedError) return;
       setError(e instanceof Error ? e.message : "load failed");
     } finally {
       setLoading(false);
@@ -82,6 +85,7 @@ export function DocumentList({ activeId, onSelect, refreshToken = 0 }: Props) {
       await deleteDocument(id);
       setDocs((d) => d.filter((x) => x.id !== id));
     } catch (err) {
+      if (err instanceof UnauthorizedError) return;
       setError(err instanceof Error ? err.message : "delete failed");
     }
   }

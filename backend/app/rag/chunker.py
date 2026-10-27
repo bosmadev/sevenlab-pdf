@@ -78,6 +78,10 @@ def chunk_pages(
     Chunks are produced per page so each chunk maps unambiguously to a single
     source page. Overlap is handled inside a page; pages do not bleed into
     each other (page citations must stay accurate for T-012's RAG prompts).
+
+    ``chunk_index`` is document-global and monotonic across pages: T-008
+    keys the Mongo row as ``<doc_id>:<chunk_index>``, so a per-page counter
+    would make page 2's first chunk overwrite page 1's.
     """
     settings = get_settings()
     size = chunk_size if chunk_size is not None else settings.chunk_size
@@ -87,12 +91,13 @@ def chunk_pages(
     splitter = _build_splitter(size, overlap)
 
     out: list[Chunk] = []
+    next_index = 0
     for page in pages:
         text = (page.text or "").strip()
         if not text:
             continue
         parts = splitter.split_text(text)
-        for i, part in enumerate(parts):
+        for part in parts:
             if not part.strip():
                 continue
             out.append(
@@ -101,10 +106,11 @@ def chunk_pages(
                     page_num=page.page_num,
                     doc_id=doc_id,
                     created_at=stamp,
-                    chunk_index=i,
+                    chunk_index=next_index,
                     char_count=len(part),
                 )
             )
+            next_index += 1
     return out
 
 

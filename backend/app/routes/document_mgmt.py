@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.db.postgres import get_db
@@ -35,6 +35,7 @@ from app.schemas.documents import (
 )
 from app.security.deps import Owner, require_owner
 from app.services import chat_history, document_service
+from app.services.audit import audit_document_deleted, extract_client_ip
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +120,7 @@ def get_document(
 )
 def delete_document(
     document_id: uuid.UUID,
+    request: Request,
     owner: Owner = Depends(require_owner),
     db: Session = Depends(get_db),
 ) -> DocumentDeleteResponse:
@@ -134,7 +136,16 @@ def delete_document(
         is_admin=owner.is_admin,
     )
     assert doc.deleted_at is not None  # soft_delete_document guarantees this
-    return DocumentDeleteResponse(id=doc.id, deleted_at=doc.deleted_at)
+    doc_id, deleted_at = doc.id, doc.deleted_at
+
+    # ISO 27001 A.8.15 — every delete carries actor workspace + client IP.
+    audit_document_deleted(
+        session=db,
+        workspace_id=owner.workspace_id,
+        document_id=doc_id,
+        client_ip=extract_client_ip(request),
+    )
+    return DocumentDeleteResponse(id=doc_id, deleted_at=deleted_at)
 
 
 @router.get("/{document_id}/chat", response_model=ChatHistoryResponse)

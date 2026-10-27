@@ -83,11 +83,12 @@ def test_invalid_overlap_rejected():
         chunk_text("x" * 100, doc_id="d", chunk_size=0, chunk_overlap=0)
 
 
-def test_chunk_index_is_monotonic_per_page():
+def test_chunk_index_is_document_global_and_unique():
+    """`<doc_id>:<chunk_index>` is the Mongo _id — it must never collide."""
     pages = [Page(page_num=p, text=SAMPLE_PARAGRAPHS) for p in (1, 2)]
     chunks = chunk_pages(pages, doc_id="d", chunk_size=100, chunk_overlap=20)
-    for page_num in (1, 2):
-        page_chunks = [c for c in chunks if c.page_num == page_num]
-        indices = [c.chunk_index for c in page_chunks]
-        assert indices == sorted(indices)
-        assert indices[0] == 0
+    indices = [c.chunk_index for c in chunks]
+    assert indices == list(range(len(chunks)))
+    page_two = [c.chunk_index for c in chunks if c.page_num == 2]
+    assert page_two and page_two[0] > 0
+    assert len({f"d:{i}" for i in indices}) == len(chunks)

@@ -38,16 +38,24 @@ def _check_postgres() -> dict:
             conn.execute(text("SELECT 1"))
         return {"ok": True}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        # This endpoint is unauthenticated: log the driver message (it can
+        # carry hostnames), expose only the exception class to the probe.
+        log.warning("health.postgres unreachable: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def _check_mongo() -> dict:
     try:
         from app.db.mongodb import ping
 
-        return ping()
+        res = ping()
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        log.warning("health.mongodb unreachable: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": type(exc).__name__}
+    if not res.get("ok"):
+        log.warning("health.mongodb unreachable: %s", res.get("error"))
+        return {"ok": False, "error": "unreachable"}
+    return res
 
 
 @router.get("/api/health/deep")

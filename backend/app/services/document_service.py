@@ -3,10 +3,13 @@
 Workspace isolation: every query filters by ``workspace_id`` unless the
 caller is the admin owner (``is_admin_owner``).
 
-Soft delete sets ``Document.deleted_at`` to now. Original PDF bytes in
-GridFS and chunk embeddings in the ``pdfs`` Mongo collection are left in
-place; a Phase-2 cleanup task sweeps rows whose ``deleted_at`` is older
-than the retention window.
+Soft delete sets ``Document.deleted_at`` to now, then purges the derived
+data the row points at: chunk embeddings in the ``pdfs`` Mongo collection
+(``app.db.vector.delete_document_chunks``) and the sanitized PDF bytes in
+GridFS (``app.services.gridfs_storage.delete_pdf``). The Postgres row stays
+as the ISO A.8.15 audit trail. A purge failure is logged, never raised: the
+row is already marked deleted, and ``app.rag.retriever`` drops every chunk
+whose ``doc_id`` is soft-deleted as a second guard.
 """
 from __future__ import annotations
 
@@ -18,7 +21,9 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.db import vector as _vector_mod
 from app.db.models import Document
+from app.services import gridfs_storage as _gridfs_mod
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +113,39 @@ def get_document(
     return doc
 
 
+def _purge_derived_data(doc: Document) -> bool:
+    """Drop the Mongo chunks and GridFS bytes behind a deleted row.
+
+    Returns True when the chunk purge succeeded, so the caller can zero
+    ``chunk_count``. Each step is independent and best-effort: a Mongo
+    outage must not roll back a delete the user already saw succeed.
+    """
+    workspace_id = doc.workspace_id
+    doc_id = str(doc.id)
+    ctx = {"workspace_id": workspace_id, "document_id": doc_id}
+
+    chunks_purged = False
+    try:
+        removed = _vector_mod.delete_document_chunks(workspace_id, doc_id)
+        chunks_purged = True
+        log.info("document.purge_chunks", extra={**ctx, "removed": removed})
+    except Exception:  # noqa: BLE001 — pymongo raises many types
+        log.exception("document.purge_chunks_failed", extra=ctx)
+
+    try:
+        _gridfs_mod.delete_pdf(doc.gridfs_file_id, workspace_id=workspace_id)
+        log.info(
+            "document.purge_pdf",
+            extra={**ctx, "gridfs_file_id": doc.gridfs_file_id},
+        )
+    except _gridfs_mod.PdfNotFoundError:
+        pass  # bytes already gone — purge is idempotent
+    except Exception:  # noqa: BLE001
+        log.exception("document.purge_pdf_failed", extra=ctx)
+
+    return chunks_purged
+
+
 def soft_delete_document(
     db: Session,
     *,
@@ -115,7 +153,10 @@ def soft_delete_document(
     workspace_id: str,
     is_admin: bool = False,
 ) -> Document:
-    """Mark a document deleted. Idempotent — a second DELETE returns the row."""
+    """Mark a document deleted and purge its chunks + PDF bytes.
+
+    Idempotent — a second DELETE returns the row without purging again.
+    """
     doc = get_document(
         db,
         document_id=document_id,
@@ -137,4 +178,9 @@ def soft_delete_document(
                 "sha256": doc.sha256,
             },
         )
+        if _purge_derived_data(doc):
+            doc.chunk_count = 0
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
     return doc

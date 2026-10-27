@@ -9,9 +9,15 @@ Guards ``POST /api/auth`` from two concrete attacks on this box:
    is a denial-of-service, not just a login nuisance.
 
 Deliberately in-process (no Redis): the app is a single service behind Caddy.
-With uvicorn ``--workers 4`` the budget multiplies by worker count (8 tries
-per 10 min x 4 workers = 32 tries total) — acceptable for MVP; swap for an
-external Redis limiter in Phase 2 (T-109).
+With uvicorn ``--workers 4`` the budget multiplies by worker count (3 tries
+per minute x 4 workers = 12 tries before every worker has locked the client
+out for 15 min) — acceptable for MVP; swap for an external Redis limiter in
+Phase 2 (T-109).
+
+Limits come from ``app.config.Settings`` (``LOGIN_RATE_MAX_ATTEMPTS``,
+``LOGIN_RATE_WINDOW_SECONDS``, ``LOGIN_RATE_LOCKOUT_SECONDS``); the module
+constants below are the documented defaults and the fallback when settings
+cannot be loaded.
 
 Port of ``~/source/scraper/main/lib/login-rate-limit.ts``.
 """
@@ -24,14 +30,29 @@ from typing import Dict
 
 from fastapi import Request
 
-# Attempts permitted inside the window before throttling kicks in.
-MAX_ATTEMPTS = 8
+from app.config import get_settings
+
+# Failed attempts permitted inside the window before throttling kicks in.
+MAX_ATTEMPTS = 3
 # Sliding window length (seconds).
-WINDOW_SEC = 10 * 60
+WINDOW_SEC = 60
 # How long a throttled client stays locked out (seconds).
 LOCKOUT_SEC = 15 * 60
 # Cap on tracked clients so a spoofed-IP flood cannot grow the Map forever.
 MAX_TRACKED = 5_000
+
+
+def _limits() -> tuple[int, int, int]:
+    """``(max_attempts, window_sec, lockout_sec)`` — settings first, module defaults as floor."""
+    try:
+        s = get_settings()
+    except Exception:  # noqa: BLE001 — a config error must never disable the gate
+        return MAX_ATTEMPTS, WINDOW_SEC, LOCKOUT_SEC
+    return (
+        max(1, int(getattr(s, "login_rate_max_attempts", 0) or MAX_ATTEMPTS)),
+        max(1, int(getattr(s, "login_rate_window_seconds", 0) or WINDOW_SEC)),
+        max(1, int(getattr(s, "login_rate_lockout_seconds", 0) or LOCKOUT_SEC)),
+    )
 
 
 @dataclass
@@ -72,11 +93,12 @@ def client_key_for(request: Request) -> str:
 
 def _prune(now: float) -> None:
     """Drop expired entries so the map cannot grow without bound."""
+    _, window, _ = _limits()
     dead: list[str] = []
     for key, bucket in _buckets.items():
         if bucket.locked_until > now:
             continue
-        bucket.failures = [t for t in bucket.failures if now - t < WINDOW_SEC]
+        bucket.failures = [t for t in bucket.failures if now - t < window]
         if not bucket.failures:
             dead.append(key)
     for key in dead:
@@ -90,6 +112,7 @@ def check_login_rate(request: Request) -> RateVerdict:
     """
     now = time.time()
     client_key = client_key_for(request)
+    max_attempts, window, lockout = _limits()
 
     with _lock:
         if len(_buckets) > MAX_TRACKED:
@@ -106,13 +129,13 @@ def check_login_rate(request: Request) -> RateVerdict:
                 retry_after_sec=max(1, int((bucket.locked_until - now) + 0.5)),
             )
 
-        bucket.failures = [t for t in bucket.failures if now - t < WINDOW_SEC]
-        if len(bucket.failures) >= MAX_ATTEMPTS:
-            bucket.locked_until = now + LOCKOUT_SEC
+        bucket.failures = [t for t in bucket.failures if now - t < window]
+        if len(bucket.failures) >= max_attempts:
+            bucket.locked_until = now + lockout
             return RateVerdict(
                 allowed=False,
                 client_key=client_key,
-                retry_after_sec=LOCKOUT_SEC,
+                retry_after_sec=lockout,
             )
 
         return RateVerdict(allowed=True, client_key=client_key, retry_after_sec=0)
@@ -121,12 +144,13 @@ def check_login_rate(request: Request) -> RateVerdict:
 def record_login_failure(client_key: str) -> None:
     """Record a failed password attempt against this client."""
     now = time.time()
+    max_attempts, window, lockout = _limits()
     with _lock:
         bucket = _buckets.get(client_key) or _Bucket()
-        bucket.failures = [t for t in bucket.failures if now - t < WINDOW_SEC]
+        bucket.failures = [t for t in bucket.failures if now - t < window]
         bucket.failures.append(now)
-        if len(bucket.failures) >= MAX_ATTEMPTS:
-            bucket.locked_until = now + LOCKOUT_SEC
+        if len(bucket.failures) >= max_attempts:
+            bucket.locked_until = now + lockout
         _buckets[client_key] = bucket
 
 

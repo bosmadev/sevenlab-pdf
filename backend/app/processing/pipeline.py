@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -207,22 +208,84 @@ def _import_attr(dotted_path: str, attr: str) -> Any:
 
 
 def _load_pdf_bytes(doc: Document) -> bytes:
-    """Pull the original PDF out of GridFS. Stage: parsing."""
-    get_gridfs = _import_attr("app.db.mongodb", "get_gridfs")
+    """Pull the sanitized PDF out of GridFS. Stage: parsing.
+
+    Routed through ``gridfs_storage.read_pdf`` so the hex ``gridfs_file_id``
+    is coerced to an ObjectId (a bare ``GridFS.get(str)`` never matches) and
+    the workspace filter is enforced on the read.
+    """
+    read_pdf = _import_attr("app.services.gridfs_storage", "read_pdf")
     try:
-        fs = get_gridfs()
-        return fs.get(doc.gridfs_file_id).read()
+        return read_pdf(doc.gridfs_file_id, workspace_id=doc.workspace_id)
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("parsing", f"gridfs read failed: {exc}") from exc
 
 
 def _extract(pdf_bytes: bytes) -> Any:
-    """Run PyMuPDF + pdfplumber extraction. Stage: parsing."""
-    extract = _import_attr("app.services.pdf_extractor", "extract")
+    """Run PyMuPDF + pdfplumber extraction inside the sandbox. Stage: parsing.
+
+    The GridFS copy is already sanitized, but PyMuPDF / pdfplumber still run
+    parser code against it, so it goes through the same docker worker as the
+    upload (A.8.7). Inline mode (dev/CI) keeps the old in-process behaviour.
+    """
+    sandbox_process = _import_attr("app.services.pdf_sandbox", "sandbox_process")
     try:
-        return extract(pdf_bytes)
+        return sandbox_process(pdf_bytes).to_extraction_result()
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("parsing", f"extract failed: {exc}") from exc
+
+
+def _ocr_enrich(pdf_bytes: bytes, extraction: Any) -> str | None:
+    """Run the 3-tier OCR bridge over every page in place. Stage: parsing.
+
+    Rewrites ``extraction.pages[*].text`` with OCR-enriched text and returns
+    the dominant tier (``proximity`` / ``tesseract`` / ``azure_cv``), or
+    ``None`` when no OCR fired. Best-effort: any failure logs and keeps the
+    native text instead of failing the document.
+    """
+    pages = list(getattr(extraction, "pages", []) or [])
+    if not pages:
+        return None
+    try:
+        enrich = _import_attr("app.rag.vision", "enrich_text_with_ocr")
+    except PipelineStageError as exc:
+        logger.warning("ocr skipped: %s", exc)
+        return None
+    settings = get_settings()
+    try:
+        enriched, dominant = enrich(
+            pdf_bytes, pages, enable_azure=bool(getattr(settings, "ocr_enable_azure", True))
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ocr enrichment failed, keeping native text: %s", exc)
+        return None
+    by_page = {num: text for num, text in enriched}
+    for page in pages:
+        new_text = by_page.get(getattr(page, "page_num", None))
+        if new_text is None:
+            continue
+        try:
+            page.text = new_text
+        except Exception:  # noqa: BLE001 — frozen stub pages in tests
+            pass
+    return dominant
+
+
+def _chunker_pages(extraction: Any) -> list[Any]:
+    """Collapse an ExtractionResult into chunker pages with tables merged.
+
+    ``pdf_extractor.to_chunker_pages`` appends each page's pdfplumber tables
+    as pipe-delimited rows. Extraction objects without a ``tables`` attribute
+    (unit-test stubs) fall through to the bare page list.
+    """
+    if getattr(extraction, "tables", None) is None:
+        return list(getattr(extraction, "pages", []) or [])
+    to_pages = _import_attr("app.services.pdf_extractor", "to_chunker_pages")
+    try:
+        return list(to_pages(extraction))
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed: a silent text-only fallback would drop tables from the index again (T-004).
+        raise PipelineStageError("chunking", f"table merge failed: {exc}") from exc
 
 
 def _chunk(pages: list[Any], doc_id: str) -> list[Any]:
@@ -276,7 +339,11 @@ def _embed_and_store(
         )
 
     upsert_chunks = _import_attr("app.db.vector", "upsert_chunks")
+    delete_chunks = _import_attr("app.db.vector", "delete_document_chunks")
     try:
+        # Clear any chunks left by an earlier (failed or shorter) run so a
+        # retry can never leave stale rows past the new chunk count.
+        delete_chunks(workspace_id, doc_id)
         payload = [
             {
                 "chunk_index": c.chunk_index,
@@ -347,6 +414,7 @@ def _stage_parsing(db: Session, doc: Document, state: dict[str, Any]) -> None:
     result = _extract(pdf_bytes)
     state["extraction"] = result
     state["page_count"] = getattr(result, "page_count", None)
+    state["ocr_tier_used"] = _ocr_enrich(pdf_bytes, result)
 
 
 def _stage_chunking(db: Session, doc: Document, state: dict[str, Any]) -> None:
@@ -355,9 +423,10 @@ def _stage_chunking(db: Session, doc: Document, state: dict[str, Any]) -> None:
         doc.id,
         status=STATUS_CHUNKING,
         page_count=state.get("page_count"),
+        ocr_tier_used=state.get("ocr_tier_used"),
     )
     extraction = state["extraction"]
-    chunks = _chunk(list(getattr(extraction, "pages", [])), doc_id=str(doc.id))
+    chunks = _chunk(_chunker_pages(extraction), doc_id=str(doc.id))
     state["chunks"] = chunks
 
 
@@ -448,6 +517,7 @@ def run_pipeline(doc_id: uuid.UUID | str, *, policy: RetryPolicy | None = None) 
                 status=STATUS_READY,
                 chunk_count=state.get("chunk_count", 0),
                 page_count=state.get("page_count"),
+                ocr_tier_used=state.get("ocr_tier_used"),
                 mark_processed=True,
             )
             _audit(
@@ -455,7 +525,10 @@ def run_pipeline(doc_id: uuid.UUID | str, *, policy: RetryPolicy | None = None) 
                 workspace_id=doc.workspace_id,
                 doc_id=doc.id,
                 event_type="pipeline.ready",
-                details=f"chunks={state.get('chunk_count', 0)}",
+                details=(
+                    f"chunks={state.get('chunk_count', 0)} "
+                    f"ocr_tier={state.get('ocr_tier_used') or 'none'}"
+                ),
             )
             final_status = STATUS_READY
         except PipelineStageError as exc:
@@ -487,14 +560,22 @@ def run_pipeline(doc_id: uuid.UUID | str, *, policy: RetryPolicy | None = None) 
 def _schedule_task(doc_id: uuid.UUID) -> asyncio.Task | None:
     """Submit a document to the running asyncio loop as a background task.
 
-    Returns the Task when a loop is running, ``None`` when called from a
-    synchronous context (tests, Celery worker). The caller may ignore the
-    return value — the pipeline writes its own status to Postgres so the
-    frontend never depends on the Task object.
+    Returns the Task when a loop is running. Without a running loop (CLI
+    scripts, a sync Starlette background task running in its threadpool)
+    the pipeline is started on a daemon thread and ``None`` is returned.
+    The caller may ignore the return value — the pipeline writes its own
+    status to Postgres so the frontend never depends on the Task object.
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        thread = threading.Thread(
+            target=run_pipeline,
+            args=(doc_id,),
+            name=f"pipeline:{doc_id}",
+            daemon=True,
+        )
+        thread.start()
         return None
 
     async def _runner() -> None:
@@ -515,17 +596,12 @@ def enqueue(doc_id: uuid.UUID | str) -> None:
     """Schedule a document for processing. Non-blocking.
 
     If an asyncio loop is running (FastAPI handlers always run inside one),
-    the pipeline runs in a worker thread. Outside a loop (CLI scripts), the
-    caller is expected to invoke ``run_pipeline`` directly.
+    the pipeline runs via ``asyncio.to_thread``. Outside a loop it runs on a
+    daemon thread instead, so no caller silently drops a document.
     """
     if isinstance(doc_id, str):
         doc_id = uuid.UUID(doc_id)
-    task = _schedule_task(doc_id)
-    if task is None:
-        logger.warning(
-            "enqueue(%s) called outside asyncio loop; call run_pipeline() directly",
-            doc_id,
-        )
+    _schedule_task(doc_id)
 
 
 # ---------------------------------------------------------------------------

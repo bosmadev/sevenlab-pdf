@@ -18,10 +18,20 @@ export function ChatInput({ disabled, streaming, onSubmit, onCancel }: Props) {
     if (!text || disabled) return;
     onSubmit(text);
     setValue("");
-    requestAnimationFrame(() => ref.current?.focus());
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.style.height = "auto";
+      el.focus();
+    });
   }
 
   function onKey(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Escape" && streaming && onCancel) {
+      e.preventDefault();
+      onCancel();
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -31,14 +41,14 @@ export function ChatInput({ disabled, streaming, onSubmit, onCancel }: Props) {
   return (
     <form
       onSubmit={submit}
-      className="border border-tui-border bg-tui-surface rounded-tui p-2 flex gap-2 items-end"
+      className="border border-tui-border bg-tui-surface rounded-tui p-2 flex gap-2 items-end focus-within:border-tui-borderActive transition-colors"
     >
       <span className="text-tui-accent select-none pt-1 text-sm">&gt;</span>
       <textarea
         ref={ref}
         rows={1}
         value={value}
-        placeholder={streaming ? "streaming... (shift+enter for newline)" : "ask a question about your PDFs"}
+        placeholder={streaming ? "streaming… esc to stop, or type the next question" : "ask a question about your PDFs"}
         onChange={(e) => {
           setValue(e.target.value);
           const el = e.currentTarget;
@@ -49,12 +59,13 @@ export function ChatInput({ disabled, streaming, onSubmit, onCancel }: Props) {
         disabled={disabled && !streaming}
         className="flex-1 bg-transparent outline-none resize-none text-sm text-tui-text placeholder:text-tui-textMuted min-h-[1.5rem] max-h-[200px]"
         aria-label="chat input"
+        autoFocus
       />
       {streaming && onCancel ? (
         <button
           type="button"
           onClick={onCancel}
-          className="text-xs px-2 py-1 border border-tui-danger text-tui-danger rounded-tui hover:bg-tui-danger/10 shrink-0"
+          className="tui-btn tui-btn-danger shrink-0"
           aria-label="cancel stream"
         >
           STOP
@@ -63,7 +74,7 @@ export function ChatInput({ disabled, streaming, onSubmit, onCancel }: Props) {
         <button
           type="submit"
           disabled={disabled || !value.trim()}
-          className="text-xs px-2 py-1 border border-tui-border rounded-tui text-tui-accent hover:border-tui-borderActive disabled:opacity-40 shrink-0"
+          className="tui-btn tui-btn-primary shrink-0"
           aria-label="send message"
         >
           SEND ↵

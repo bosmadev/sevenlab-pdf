@@ -102,6 +102,11 @@ export function MessageBubble({ message }: Props) {
             second: "2-digit",
           })}
         </span>
+        {message.cancelled && !isErr && (
+          <span className="text-tui-warn ml-2" data-testid="msg-cancelled">
+            [stopped]
+          </span>
+        )}
       </header>
 
       <div

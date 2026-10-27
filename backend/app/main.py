@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.errors import RequestIdMiddleware, register_exception_handlers
+from app.logging_config import configure_logging
 from app.routes import (
     auth,
     chat,
@@ -37,11 +38,12 @@ from app.routes import (
 )
 from app.security.middleware import WorkspaceAuthMiddleware
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
+# Console + backend/logs/{app,error,audit}.log, every line stamped with the
+# request id. LOG_DIR / LOG_LEVEL override; see app/logging_config.py.
+LOG_DIR = configure_logging()
 log = logging.getLogger("sevenlab.main")
+if LOG_DIR is not None:
+    log.info("file logging enabled dir=%s", LOG_DIR)
 
 settings = get_settings()
 

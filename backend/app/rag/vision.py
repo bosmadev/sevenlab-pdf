@@ -146,15 +146,18 @@ def run_azure_cv(img: Image.Image) -> tuple[str, float, Optional[str]]:
     `error` carries a short diagnostic string.
     """
     settings = get_settings()
-    if not settings.azure_ai_api_key:
+    # Dedicated Vision host/key win; otherwise reuse the AI Foundry pair.
+    key = getattr(settings, "azure_cv_key", "") or settings.azure_ai_api_key
+    base = getattr(settings, "azure_cv_endpoint", "") or settings.azure_ai_api_base
+    if not key:
         return "", 0.0, "AZURE_AI_API_KEY not configured"
     if img.width < MIN_IMAGE_DIM or img.height < MIN_IMAGE_DIM:
         return "", 0.0, f"image below {MIN_IMAGE_DIM}px minimum"
 
-    url = f"{settings.azure_ai_api_base.rstrip('/')}{AZURE_IMAGE_ANALYSIS_PATH}"
+    url = f"{base.rstrip('/')}{AZURE_IMAGE_ANALYSIS_PATH}"
     params = {"api-version": AZURE_API_VERSION, "features": AZURE_FEATURES}
     headers = {
-        "Ocp-Apim-Subscription-Key": settings.azure_ai_api_key,
+        "Ocp-Apim-Subscription-Key": key,
         "Content-Type": "application/octet-stream",
     }
     payload = _image_to_png_bytes(img)

@@ -6,8 +6,9 @@ grounded chunks the LLM will cite:
     1. Query embedding   -> ``app.rag.embeddings.embed_query``
     2. Dense retrieval   -> ``app.db.vector.vector_search``       (top-20)
     3. Sparse retrieval  -> ``app.rag.bm25.bm25_search``          (top-20)
-    4. Rank fusion       -> ``app.rag.rrf.reciprocal_rank_fusion``
-    5. Cross-encoder     -> ``app.rag.reranker.rerank``           (top-8)
+    4. Deleted-doc guard -> :func:`deleted_doc_ids` (Postgres ``deleted_at``)
+    5. Rank fusion       -> ``app.rag.rrf.reciprocal_rank_fusion``
+    6. Cross-encoder     -> ``app.rag.reranker.rerank``           (top-8)
 
 The two retrievers run concurrently (dense is HTTP → Mongo, sparse is
 pure Mongo), fused by rank position with RRF so disagreeing score scales
@@ -28,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -122,6 +125,50 @@ def _bm25_hits_to_payloads(
     ]
 
 
+def _norm_doc_id(raw: Any) -> str | None:
+    """Canonical ``documents.id`` string, or None when the value is not a UUID."""
+    try:
+        return str(uuid.UUID(str(raw)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def deleted_doc_ids(
+    workspace_id: str,
+    doc_ids: Iterable[str],
+    *,
+    session_factory: Any = None,
+) -> set[str]:
+    """Return the subset of ``doc_ids`` whose Postgres row is soft-deleted.
+
+    Mongo chunks carry no ``deleted_at``; ``documents.deleted_at`` in
+    Postgres is the single source of truth. ``$vectorSearch`` and
+    ``$search`` can only filter on paths declared in their index
+    definitions (``workspace_id``, ``doc_id``), so the check runs here,
+    after retrieval and before fusion: one indexed ``IN`` query over at
+    most ``vector_top_k + bm25_top_k`` ids per search.
+    """
+    ids = {n for n in (_norm_doc_id(d) for d in doc_ids) if n is not None}
+    if not ids:
+        return set()
+
+    from sqlalchemy import select
+
+    from app.db.models import Document
+    from app.db.postgres import SessionLocal
+
+    factory = session_factory or SessionLocal
+    db = factory()
+    try:
+        stmt = select(Document.id).where(
+            Document.id.in_([uuid.UUID(i) for i in ids]),
+            Document.deleted_at.is_not(None),
+        )
+        return {str(row) for row in db.execute(stmt).scalars()}
+    finally:
+        db.close()
+
+
 # ---- Public entrypoint ------------------------------------------------------
 
 
@@ -149,6 +196,7 @@ class HybridRetriever:
     vector_search_fn: Any = None        # sync (workspace, qvec, top_k, doc_id?) -> list[dict]
     bm25_search_fn: Any = None          # sync (workspace, q, top_k, doc_id=None) -> list[BM25Hit]
     rerank_fn: Any = None               # sync (query, candidates, top_k, model, device) -> list
+    deleted_doc_ids_fn: Any = None      # sync (workspace, doc_ids) -> set[str]
 
     def _embed(self):
         # embed_query_async matches our (text, *, dimension=None) async contract
@@ -164,6 +212,56 @@ class HybridRetriever:
 
     def _rerank(self):
         return self.rerank_fn or _reranker_mod.rerank
+
+    def _deleted(self):
+        return self.deleted_doc_ids_fn or deleted_doc_ids
+
+    async def _drop_deleted(
+        self,
+        workspace_id: str,
+        vec_payloads: list[dict[str, Any]],
+        bm25_payloads: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Remove hits whose parent document is soft-deleted in Postgres.
+
+        Fails open: if the lookup itself errors the hits are served
+        unfiltered with a warning, matching how the two retrievers degrade.
+        The delete path has already purged the chunks in the normal case,
+        so this guard only matters for a failed purge or an in-flight race.
+        """
+        candidate_ids = {
+            p["doc_id"] for p in (*vec_payloads, *bm25_payloads) if p["doc_id"]
+        }
+        if not candidate_ids:
+            return vec_payloads, bm25_payloads
+        try:
+            deleted = await asyncio.to_thread(
+                self._deleted(), workspace_id, sorted(candidate_ids)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "deleted-document filter unavailable, serving unfiltered: %s", exc
+            )
+            return vec_payloads, bm25_payloads
+        if not deleted:
+            return vec_payloads, bm25_payloads
+
+        gone = {_norm_doc_id(d) or str(d) for d in deleted}
+
+        def _keep(p: dict[str, Any]) -> bool:
+            return (_norm_doc_id(p["doc_id"]) or p["doc_id"]) not in gone
+
+        kept_vec = [p for p in vec_payloads if _keep(p)]
+        kept_bm25 = [p for p in bm25_payloads if _keep(p)]
+        dropped = len(vec_payloads) + len(bm25_payloads) - len(kept_vec) - len(kept_bm25)
+        if dropped:
+            logger.info(
+                "dropped %d chunk(s) from %d soft-deleted document(s) workspace=%s",
+                dropped,
+                len(gone),
+                workspace_id,
+            )
+        return kept_vec, kept_bm25
 
     async def search(
         self,
@@ -235,6 +333,13 @@ class HybridRetriever:
         # kwarg, so a per-document chat can never leak sibling documents.
         if doc_id is not None:
             bm25_payloads = [p for p in bm25_payloads if p["doc_id"] == doc_id]
+
+        # Soft-deleted documents: the delete path purges their Mongo chunks,
+        # but a purge can fail or race an in-flight search, so any hit whose
+        # Postgres row carries ``deleted_at`` is dropped here before fusion.
+        vec_payloads, bm25_payloads = await self._drop_deleted(
+            workspace_id, vec_payloads, bm25_payloads
+        )
 
         if not vec_payloads and not bm25_payloads:
             return []
@@ -320,7 +425,8 @@ async def hybrid_search(
     Each dict carries the keys ``app.rag.pipeline._format_context`` reads:
     ``chunk_id``, ``doc_id``, ``chunk_text``, ``page_num``, ``score``
     (the final rerank score — not RRF or vector), plus provenance in
-    ``vector_score``, ``bm25_score``, ``rrf_score``, ``sources``.
+    ``vector_score``, ``bm25_score``, ``rrf_score``, ``sources``. Chunks of
+    soft-deleted documents are excluded (see :func:`deleted_doc_ids`).
     """
     hits = await get_default_retriever().search(
         workspace_id,
@@ -353,6 +459,7 @@ __all__ = [
     "HybridRetriever",
     "hybrid_search",
     "chunk_to_dict",
+    "deleted_doc_ids",
     "get_default_retriever",
     "DEFAULT_VECTOR_TOP_K",
     "DEFAULT_BM25_TOP_K",

@@ -77,7 +77,19 @@ if [[ ! -d .venv ]]; then
     sudo -u "${SERVICE_USER}" python3 -m venv .venv
 fi
 sudo -u "${SERVICE_USER}" .venv/bin/pip install --upgrade pip wheel >/dev/null
+# CPU-only torch first: the box has no GPU and the default wheel pulls ~4 GB of
+# CUDA libs. sentence-transformers accepts any torch, so requirements.txt keeps it.
+sudo -u "${SERVICE_USER}" .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
 sudo -u "${SERVICE_USER}" .venv/bin/pip install -r requirements.txt
+
+# Pre-fetch the reranker (BAAI/bge-reranker-v2-m3, ~2.2 GB) into HF_HOME so the
+# first chat does not block on a download. The unit sets HF_HOME to this path;
+# it lives outside the rsync tree so --delete never wipes it.
+HF_CACHE=/var/cache/sevenlab/huggingface
+sudo mkdir -p "${HF_CACHE}"
+sudo chown -R "${SERVICE_USER}:${SERVICE_GROUP}" /var/cache/sevenlab
+sudo -u "${SERVICE_USER}" env HF_HOME="${HF_CACHE}" .venv/bin/python -c \
+    "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-reranker-v2-m3', allow_patterns=['*.json', '*.safetensors', '*.model', '*.txt'])"
 
 # -----------------------------------------------------------------------------
 # 3. Frontend build
@@ -86,6 +98,14 @@ say "Building Next.js frontend"
 cd "${INSTALL_ROOT}/frontend"
 sudo -u "${SERVICE_USER}" npm ci --prefer-offline --no-audit --fund=false
 sudo -u "${SERVICE_USER}" npm run build
+
+# -----------------------------------------------------------------------------
+# 3b. PDF sandbox image (PDF_SANDBOX_MODE=docker in backend/.env)
+# -----------------------------------------------------------------------------
+say "Building sevenlab-pdf-worker image"
+need docker
+cd "${INSTALL_ROOT}"
+sudo -u "${SERVICE_USER}" bash backend/scripts/build_pdf_worker.sh
 
 # -----------------------------------------------------------------------------
 # 4. systemd units
@@ -101,6 +121,18 @@ sudo systemctl daemon-reload
 say "Installing Caddy snippet"
 sudo mkdir -p /etc/caddy/conf.d
 sudo install -m 0644 "${DEPLOY_DIR}/Caddyfile.sevenlab" /etc/caddy/conf.d/sevenlab.caddy
+
+# `caddy validate` as root opens the log file with O_CREATE, leaving it root:root 0600,
+# and the reload (User=caddy) then fails to open it. Pre-create it caddy-owned.
+if [[ ! -e /var/log/caddy/sevenlab.log ]]; then
+    sudo install -o caddy -g caddy -m 0640 /dev/null /var/log/caddy/sevenlab.log
+fi
+
+# The snippet only loads if the main Caddyfile imports conf.d — fail loudly, not silently.
+if ! grep -qE '^\s*import\s+conf\.d/\*\.caddy' /etc/caddy/Caddyfile; then
+    echo "WARNING: /etc/caddy/Caddyfile has no 'import conf.d/*.caddy' line — sevenlab vhost will NOT load." >&2
+    echo "Append it:  echo 'import conf.d/*.caddy' | sudo tee -a /etc/caddy/Caddyfile" >&2
+fi
 
 # Only reload Caddy if the config validates — a bad snippet would 502 the whole box.
 if sudo caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then

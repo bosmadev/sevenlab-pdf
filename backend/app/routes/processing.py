@@ -105,6 +105,15 @@ async def retry_processing(
             status_code=status.HTTP_409_CONFLICT,
             detail="document already in terminal state 'ready'; nothing to retry",
         )
+    if not report.is_terminal:
+        # A retry mid-run would enqueue a second pipeline for the same doc.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "STILL_PROCESSING",
+                "reason": f"document is still {report.status}; retry once it finishes or fails",
+            },
+        )
 
     scheduled = pipeline.retry(doc_uuid)
     if not scheduled:

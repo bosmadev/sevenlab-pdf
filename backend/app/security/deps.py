@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from fastapi import Cookie, Depends, HTTPException, status
 
 from app.security.password import is_admin_owner
-from app.security.tokens import COOKIE_NAME, verify_session_token
+from app.security.session_store import resolve_session
+from app.security.tokens import COOKIE_NAME
 
 
 @dataclass(frozen=True)
@@ -28,10 +29,12 @@ class Owner:
 
 
 def _owner_from_cookie(cookie_value: str | None) -> Owner | None:
-    owner_id = verify_session_token(cookie_value)
-    if not owner_id:
+    # Sync dependency: FastAPI runs it in a threadpool, so the DB lookup
+    # inside ``resolve_session`` does not block the event loop.
+    claims = resolve_session(cookie_value)
+    if claims is None:
         return None
-    return Owner(owner_id=owner_id, is_admin=is_admin_owner(owner_id))
+    return Owner(owner_id=claims.owner_id, is_admin=is_admin_owner(claims.owner_id))
 
 
 def require_owner(

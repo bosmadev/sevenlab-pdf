@@ -1,15 +1,24 @@
 /**
  * UploadDropzone — drag-and-drop PDF uploader.
  *
- * Mirrors backend validation (MIME + extension + size) client-side so the
- * user gets a fast rejection; the backend `services/pdf_validator.py` is
- * the authoritative check. Streams progress via XHR (fetch cannot expose
- * request-body progress yet).
+ * Mirrors backend validation (extension + MIME + size) client-side via
+ * `validatePdfFile` so the user gets a fast rejection; the backend
+ * `services/pdf_validator.py` is the authoritative check. Streams progress
+ * via XHR (fetch cannot expose request-body progress yet).
+ *
+ * Phases: idle → uploading (bytes in flight) → uploading at 100% (server is
+ * validating + sanitizing) → done | error. A 401 routes to /login.
  */
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { uploadPdf, type UploadResponse } from "@/lib/documents";
+import { UnauthorizedError } from "@/lib/api";
+import {
+  DEFAULT_MAX_PDF_MB,
+  uploadPdf,
+  validatePdfFile,
+  type UploadResponse,
+} from "@/lib/documents";
 
 interface Props {
   /** Maximum file size in MB — must match backend MAX_PDF_SIZE_MB. */
@@ -21,37 +30,24 @@ interface Props {
 type UploadState =
   | { phase: "idle" }
   | { phase: "uploading"; name: string; ratio: number }
-  | { phase: "error"; message: string }
-  | { phase: "done"; name: string };
+  | { phase: "error"; message: string; name?: string }
+  | { phase: "done"; name: string; pages?: number };
 
-function clientValidate(file: File, maxBytes: number): string | null {
-  if (!/\.pdf$/i.test(file.name)) return "only .pdf files are accepted";
-  // The input accept="application/pdf" sometimes yields an empty type on
-  // drag-dropped files, so we also check extension above.
-  if (file.type && file.type !== "application/pdf") {
-    return `unexpected mime: ${file.type}`;
-  }
-  if (file.size === 0) return "empty file";
-  if (file.size > maxBytes) {
-    const mb = (file.size / (1024 * 1024)).toFixed(1);
-    return `too large (${mb} MB)`;
-  }
-  return null;
-}
-
-export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
+export function UploadDropzone({
+  maxSizeMb = DEFAULT_MAX_PDF_MB,
+  onUploaded,
+}: Props) {
   const [state, setState] = useState<UploadState>({ phase: "idle" });
+  const [notice, setNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const maxBytes = maxSizeMb * 1024 * 1024;
-
   const start = useCallback(
     async (file: File) => {
-      const err = clientValidate(file, maxBytes);
+      const err = validatePdfFile(file, maxSizeMb);
       if (err) {
-        setState({ phase: "error", message: err });
+        setState({ phase: "error", message: err, name: file.name });
         return;
       }
 
@@ -67,26 +63,37 @@ export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
           onProgress: (ratio) =>
             setState({ phase: "uploading", name: file.name, ratio }),
         });
-        setState({ phase: "done", name: file.name });
+        setState({ phase: "done", name: file.name, pages: doc.page_count });
         onUploaded?.(doc);
       } catch (e) {
         if ((e as DOMException)?.name === "AbortError") {
           setState({ phase: "idle" });
           return;
         }
+        if (e instanceof UnauthorizedError) {
+          // lib/session.redirectToLogin() already navigated to /login.
+          setState({ phase: "idle" });
+          return;
+        }
         setState({
           phase: "error",
+          name: file.name,
           message: e instanceof Error ? e.message : "upload failed",
         });
       }
     },
-    [maxBytes, onUploaded],
+    [maxSizeMb, onUploaded],
   );
 
   const onFiles = useCallback(
     async (files: FileList | File[] | null) => {
       if (!files || files.length === 0) return;
       // One at a time keeps the UX legible; multi-upload is Phase 2.
+      setNotice(
+        files.length > 1
+          ? `${files.length - 1} extra file(s) ignored, one upload at a time`
+          : null,
+      );
       await start(files[0]);
     },
     [start],
@@ -95,6 +102,8 @@ export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
   const cancel = () => abortRef.current?.abort();
 
   const busy = state.phase === "uploading";
+  const sent = state.phase === "uploading" && state.ratio >= 1;
+  const pct = state.phase === "uploading" ? Math.round(state.ratio * 100) : 0;
 
   return (
     <section
@@ -105,7 +114,7 @@ export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
       }`}
       onDragOver={(e) => {
         e.preventDefault();
-        setDragging(true);
+        if (!busy) setDragging(true);
       }}
       onDragLeave={() => setDragging(false)}
       onDrop={(e) => {
@@ -116,6 +125,7 @@ export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
       }}
       aria-busy={busy}
       aria-label="Upload PDF"
+      data-testid="upload-dropzone"
     >
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -139,27 +149,44 @@ export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
           type="file"
           accept="application/pdf,.pdf"
           className="hidden"
-          onChange={(e) => void onFiles(e.target.files)}
+          data-testid="upload-input"
+          onChange={(e) => {
+            const files = e.target.files;
+            // Reset so picking the same file again re-fires onChange.
+            e.target.value = "";
+            void onFiles(files);
+          }}
           disabled={busy}
         />
       </div>
 
+      {notice && (
+        <div className="mt-2 text-xs text-tui-warn" role="note">
+          · {notice}
+        </div>
+      )}
+
       {state.phase === "uploading" && (
-        <div className="mt-3">
+        <div className="mt-3" data-testid="upload-progress">
           <div className="text-tui-textMuted text-xs mb-1 flex justify-between">
             <span className="truncate pr-2">{state.name}</span>
-            <span className="shrink-0 text-tui-accent">
-              {Math.round(state.ratio * 100)}%
+            <span
+              className={`shrink-0 text-tui-accent ${sent ? "animate-pulse" : ""}`}
+            >
+              {sent ? "validating on server…" : `${pct}%`}
             </span>
           </div>
           <div className="h-1.5 bg-tui-base rounded overflow-hidden">
             <div
-              className="h-full bg-tui-accent transition-all"
-              style={{ width: `${Math.max(2, state.ratio * 100)}%` }}
+              className={`h-full bg-tui-accent transition-all ${
+                sent ? "animate-pulse" : ""
+              }`}
+              style={{ width: `${Math.max(2, pct)}%` }}
               role="progressbar"
               aria-valuemin={0}
               aria-valuemax={100}
-              aria-valuenow={Math.round(state.ratio * 100)}
+              aria-valuenow={pct}
+              aria-label={sent ? "validating on server" : "uploading"}
             />
           </div>
           <button
@@ -175,18 +202,22 @@ export function UploadDropzone({ maxSizeMb = 50, onUploaded }: Props) {
       {state.phase === "error" && (
         <div
           role="alert"
+          data-testid="upload-error"
           className="mt-3 text-xs text-tui-danger border border-tui-danger/40 rounded p-2"
         >
-          ! {state.message}
+          ! {state.name ? `${state.name}: ` : ""}
+          {state.message}
         </div>
       )}
 
       {state.phase === "done" && (
         <div
           role="status"
+          data-testid="upload-done"
           className="mt-3 text-xs text-tui-success"
         >
           ✓ queued: {state.name}
+          {state.pages != null ? ` (${state.pages} page${state.pages === 1 ? "" : "s"})` : ""}
         </div>
       )}
     </section>
